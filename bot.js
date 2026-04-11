@@ -12,7 +12,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const OMDB_API_KEY = process.env.OMDB_API_KEY;
 const ADMIN_ID = Number(process.env.ADMIN_ID) || 5951923988;
 const CHANNEL = process.env.CHANNEL || '@cineradarai';
-const AUTO_DELETE_DELAY = 120000;
+const AUTO_DELETE_DELAY = 120000; // 2 minutes
 const WELCOME_GIF = 'https://media.tenor.com/8d9B7xYkZk0AAAAC/welcome.gif';
 const OMDB_BASE_URL = 'https://www.omdbapi.com/';
 
@@ -50,12 +50,12 @@ function rebuildFuseIndex() {
   });
 }
 
-// Load databases
+// Load databases with migration
 async function loadDB() {
   try {
     const data = await fs.readFile('movies.json', 'utf8');
     movies = JSON.parse(data);
-    // Auto-migration for old keys
+    // Migration for old long keys to short IDs
     let needsMigration = false;
     const newMovies = {};
     let counter = 1;
@@ -131,19 +131,30 @@ function formatFileSize(bytes) {
 }
 
 async function sendTempMessage(ctx, text, options = {}) {
-  const msg = await ctx.reply(text, options);
-  setTimeout(() => {
-    ctx.api.deleteMessage(ctx.chat.id, msg.message_id).catch(() => {});
-  }, AUTO_DELETE_DELAY);
-  return msg;
+  try {
+    const msg = await ctx.reply(text, options);
+    setTimeout(() => {
+      ctx.api.deleteMessage(ctx.chat.id, msg.message_id).catch(() => {});
+    }, AUTO_DELETE_DELAY);
+    return msg;
+  } catch (error) {
+    console.error('sendTempMessage error:', error.message);
+    return null;
+  }
 }
 
 async function sendTempAnimation(ctx, animation, options = {}) {
-  const msg = await ctx.replyWithAnimation(animation, options);
-  setTimeout(() => {
-    ctx.api.deleteMessage(ctx.chat.id, msg.message_id).catch(() => {});
-  }, AUTO_DELETE_DELAY);
-  return msg;
+  try {
+    const msg = await ctx.replyWithAnimation(animation, options);
+    setTimeout(() => {
+      ctx.api.deleteMessage(ctx.chat.id, msg.message_id).catch(() => {});
+    }, AUTO_DELETE_DELAY);
+    return msg;
+  } catch (error) {
+    console.error('sendTempAnimation error:', error.message);
+    // fallback to text if GIF fails
+    return sendTempMessage(ctx, options.caption || 'Welcome!', { parse_mode: options.parse_mode });
+  }
 }
 
 function trackUser(userId, firstName, username) {
@@ -184,7 +195,7 @@ function rateLimitMiddleware(ctx, next) {
     userData.count++;
   }
   rateLimitMap.set(userId, userData);
-  if (userData.count > 10) {
+  if (userData.count > 15) {
     return ctx.reply('⚠️ Too many requests! Slow down.');
   }
   return next();
@@ -238,6 +249,31 @@ function groupMovies(movieArray) {
 }
 
 // ==============================
+// 🔘 BUILD FILTER BUTTONS (grammY compatible)
+// ==============================
+function buildFilterButtons(query, results) {
+  const years = [...new Set(results.map(m => m.year).filter(Boolean))];
+  const langs = [...new Set(results.map(m => m.language).filter(Boolean))];
+  const quals = [...new Set(results.map(m => m.quality).filter(Boolean))];
+
+  const rows = [];
+  if (years.length) {
+    const yearRow = years.slice(0, 4).map(y => InlineKeyboard.text(`📅 ${y}`, `filter_${query}|year|${y}`));
+    rows.push(yearRow);
+  }
+  if (langs.length) {
+    const langRow = langs.slice(0, 4).map(l => InlineKeyboard.text(`🌐 ${l}`, `filter_${query}|lang|${l}`));
+    rows.push(langRow);
+  }
+  if (quals.length) {
+    const qualRow = quals.slice(0, 4).map(q => InlineKeyboard.text(`📺 ${q}`, `filter_${query}|qual|${q}`));
+    rows.push(qualRow);
+  }
+  rows.push([InlineKeyboard.text(`🔄 Show All (${results.length})`, `filter_${query}|all|all`)]);
+  return rows;
+}
+
+// ==============================
 // 🎬 BOT INITIALIZATION
 // ==============================
 const bot = new Bot(BOT_TOKEN);
@@ -255,10 +291,15 @@ bot.command('start', async (ctx) => {
   const firstName = ctx.from.first_name;
   trackUser(userId, firstName, ctx.from.username);
 
-  await sendTempAnimation(ctx, WELCOME_GIF, {
-    caption: `🎬 *Welcome to CineRadar AI, ${firstName}!*\n\n👇 Type at least 3 characters to search.\n🔥 Smart search + OMDb posters enabled.`,
-    parse_mode: 'Markdown'
-  });
+  try {
+    await sendTempAnimation(ctx, WELCOME_GIF, {
+      caption: `🎬 *Welcome to CineRadar AI, ${firstName}!*\n\n👇 Type at least 3 characters to search.\n🔥 Smart search + OMDb posters enabled.`,
+      parse_mode: 'Markdown'
+    });
+  } catch (error) {
+    // Fallback if GIF fails
+    await sendTempMessage(ctx, `🎬 *Welcome to CineRadar AI, ${firstName}!*\n\n👇 Type at least 3 characters to search.`, { parse_mode: 'Markdown' });
+  }
 });
 
 bot.command('edit', async (ctx) => {
@@ -307,7 +348,7 @@ bot.on('message', async (ctx, next) => {
 
   trackUser(userId, msg.from.first_name, msg.from.username);
 
-  // Admin upload flow
+  // Admin upload flow (video/document)
   if (isAdmin && (msg.video || msg.document)) {
     const fileId = msg.video?.file_id || msg.document?.file_id;
     const fileSize = msg.video?.file_size || msg.document?.file_size || null;
@@ -315,6 +356,7 @@ bot.on('message', async (ctx, next) => {
     return sendTempMessage(ctx, '✅ File received!\n\n📝 *Step 1/4:* Movie name:', { parse_mode: 'Markdown' });
   }
 
+  // Admin upload state machine
   if (ctx.session.upload && msg.text) {
     const state = ctx.session.upload;
     const text = sanitizeInput(msg.text);
@@ -380,7 +422,7 @@ bot.on('message', async (ctx, next) => {
         let num = parseFloat(match[1]);
         num = match[2].toUpperCase() === 'GB' ? num * 1024 * 1024 * 1024 : num * 1024 * 1024;
         movie.size = Math.round(num);
-      } else return ctx.reply('Invalid format. Use e.g., 1.5 GB');
+      } else return ctx.reply('❌ Invalid format. Use e.g., 1.5 GB');
     }
     await saveDB();
     delete adminEditState[ctx.chat.id];
@@ -430,6 +472,7 @@ bot.on('message', async (ctx, next) => {
       return;
     } catch (err) {
       console.error('Poster send error:', err.message);
+      // fallback to text search
     }
   }
 
@@ -442,14 +485,19 @@ bot.on('message', async (ctx, next) => {
 
     const filterRows = buildFilterButtons(query, results);
     let kb = new InlineKeyboard();
+
+    // Download buttons with full details
     grouped.forEach(g => g.items.forEach(m => {
       const size = m.size ? ` | ${formatFileSize(m.size)}` : '';
-      kb = kb.text(`⬇️ ${m.name} ${m.year || ''} | ${m.language || ''} | ${m.quality}${size}`, `send_${m.id}`).row();
+      kb = kb.text(`⬇️ ${m.name} ${m.year || ''} | ${m.language || 'N/A'} | ${m.quality}${size}`, `send_${m.id}`).row();
       if (isAdmin && adminEditMode[userId]) {
         kb = kb.text(`✏️ Edit "${m.name}"`, `edit_${m.id}`).row();
       }
     }));
+
+    // Add filter buttons
     filterRows.forEach(row => kb.row(...row));
+
     return sendTempMessage(ctx, text, { parse_mode: 'Markdown', reply_markup: kb });
   }
 
@@ -468,19 +516,6 @@ bot.on('message', async (ctx, next) => {
   return sendTempMessage(ctx, '❌ Movie not found.', { reply_markup: kb });
 });
 
-// Helper: filter buttons
-function buildFilterButtons(query, results) {
-  const years = [...new Set(results.map(m => m.year).filter(Boolean))];
-  const langs = [...new Set(results.map(m => m.language).filter(Boolean))];
-  const quals = [...new Set(results.map(m => m.quality).filter(Boolean))];
-  const rows = [];
-  if (years.length) rows.push(years.slice(0,4).map(y => ({ text: `📅 ${y}`, callback_data: `filter_${query}|year|${y}` })));
-  if (langs.length) rows.push(langs.slice(0,4).map(l => ({ text: `🌐 ${l}`, callback_data: `filter_${query}|lang|${l}` })));
-  if (quals.length) rows.push(quals.slice(0,4).map(q => ({ text: `📺 ${q}`, callback_data: `filter_${query}|qual|${q}` })));
-  rows.push([{ text: `🔄 Show All (${results.length})`, callback_data: `filter_${query}|all|all` }]);
-  return rows;
-}
-
 // ==============================
 // 🔘 CALLBACK HANDLER
 // ==============================
@@ -488,7 +523,7 @@ bot.on('callback_query:data', async (ctx) => {
   const data = ctx.callbackQuery.data;
   const userId = ctx.from.id;
 
-  // Upload language/quality shortcuts
+  // Upload language selection
   if (data.startsWith('ul_lang_')) {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: 'Admin only' });
     const lang = data.replace('ul_lang_', '');
@@ -501,12 +536,14 @@ bot.on('callback_query:data', async (ctx) => {
       .row().text('4K', 'ul_qual_4K');
     return sendTempMessage(ctx, '📺 *Step 4/4:* Quality:', { parse_mode: 'Markdown', reply_markup: kb });
   }
+
+  // Upload quality selection & save
   if (data.startsWith('ul_qual_')) {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: 'Admin only' });
     const qual = data.replace('ul_qual_', '');
-    ctx.session.upload.quality = qual;
-    // Save movie
     const state = ctx.session.upload;
+    if (!state) return ctx.answerCallbackQuery();
+    state.quality = qual;
     const shortId = movieCounter++;
     const key = `m_${shortId}`;
     movies[key] = {
@@ -530,12 +567,16 @@ bot.on('callback_query:data', async (ctx) => {
     const movie = movies[movieId];
     if (!movie) return ctx.answerCallbackQuery({ text: 'Not found', show_alert: true });
     const size = movie.size ? ` | ${formatFileSize(movie.size)}` : '';
-    await ctx.replyWithVideo(movie.file_id, {
+    const sent = await ctx.replyWithVideo(movie.file_id, {
       caption: `🎬 ${movie.name} ${movie.year || ''}\n🌐 ${movie.language} | 📺 ${movie.quality}${size}\n\n⚠️ Auto-delete in 2 min.`,
       reply_markup: new InlineKeyboard()
         .url('💬 Join Group', 'https://t.me/cineradarai')
         .url('📸 Instagram', 'https://instagram.com/...')
     });
+    // Auto-delete the sent video
+    setTimeout(() => {
+      ctx.api.deleteMessage(ctx.chat.id, sent.message_id).catch(() => {});
+    }, AUTO_DELETE_DELAY);
     return ctx.answerCallbackQuery();
   }
 
@@ -553,6 +594,7 @@ bot.on('callback_query:data', async (ctx) => {
     await ctx.reply(`✏️ Editing: ${movie.name}\nChoose field:`, { reply_markup: kb });
     return ctx.answerCallbackQuery();
   }
+
   if (data.startsWith('editfield_')) {
     const field = data.replace('editfield_', '');
     adminEditState[ctx.chat.id].field = field;
@@ -561,6 +603,7 @@ bot.on('callback_query:data', async (ctx) => {
     await ctx.reply(prompts[field]);
     return ctx.answerCallbackQuery();
   }
+
   if (data === 'editcancel') {
     delete adminEditState[ctx.chat.id];
     await ctx.reply('❌ Cancelled.');
@@ -577,6 +620,7 @@ bot.on('callback_query:data', async (ctx) => {
     if (type === 'year') filters.year = val;
     const results = type === 'all' ? searchLocalMovies(fullQuery) : searchLocalMovies(fullQuery, filters);
     if (results.length === 0) return ctx.answerCallbackQuery({ text: 'No results', show_alert: true });
+
     const grouped = groupMovies(results);
     let kb = new InlineKeyboard();
     grouped.forEach(g => g.items.forEach(m => {
@@ -589,7 +633,7 @@ bot.on('callback_query:data', async (ctx) => {
     return ctx.answerCallbackQuery({ text: `${results.length} results` });
   }
 
-  // Request
+  // Request movie
   if (data.startsWith('request_')) {
     const movieName = data.replace('request_', '');
     requests.push({ user: userId, movie: movieName, time: new Date() });
@@ -601,7 +645,7 @@ bot.on('callback_query:data', async (ctx) => {
 });
 
 // ==============================
-// 📅 DAILY SUGGESTIONS
+// 📅 DAILY SUGGESTIONS (NO AUTO-DELETE)
 // ==============================
 const DAILY_FILE = 'lastDailySent.json';
 async function sendDailySuggestions() {

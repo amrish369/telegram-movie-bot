@@ -12,7 +12,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const OMDB_API_KEY = process.env.OMDB_API_KEY;
 const ADMIN_ID = Number(process.env.ADMIN_ID) || 5951923988;
 const CHANNEL = process.env.CHANNEL || '@cineradarai';
-const AUTO_DELETE_DELAY = 120000; // 2 minutes
+const AUTO_DELETE_DELAY = 600000; // 10 minutes (changed from 2 min)
 const WELCOME_GIF = 'https://media.tenor.com/8d9B7xYkZk0AAAAC/welcome.gif';
 const OMDB_BASE_URL = 'https://www.omdbapi.com/';
 
@@ -457,13 +457,16 @@ bot.on('message', async (ctx, next) => {
     const localMatches = searchLocalMovies(omdbData.Title);
     let kb = new InlineKeyboard();
     if (localMatches.length > 0) {
+      // Movie exists in DB → show download buttons with full details
       const grouped = groupMovies(localMatches);
       grouped.forEach(g => g.items.forEach(m => {
         const size = m.size ? ` | ${formatFileSize(m.size)}` : '';
-        kb = kb.text(`⬇️ ${m.quality}${size}`, `send_${m.id}`).row();
+        // Full details on button: Name Year | Language | Quality | Size
+        kb = kb.text(`⬇️ ${m.name} ${m.year || ''} | ${m.language || 'N/A'} | ${m.quality}${size}`, `send_${m.id}`).row();
       }));
       caption += `\n✅ Available for download!`;
     } else {
+      // Not in DB → request button only
       kb = kb.text('📩 Request Movie', `request_${omdbData.Title}`);
       caption += `\n❌ Not available yet.`;
     }
@@ -476,7 +479,7 @@ bot.on('message', async (ctx, next) => {
     }
   }
 
-  // Fallback to local search
+  // Fallback to local search (no OMDb poster)
   const results = searchLocalMovies(query);
   if (results.length > 0) {
     const grouped = groupMovies(results);
@@ -507,7 +510,8 @@ bot.on('message', async (ctx, next) => {
     const grouped = groupMovies(sugResults);
     let kb = new InlineKeyboard();
     grouped.forEach(g => g.items.forEach(m => {
-      kb = kb.text(`⬇️ ${m.quality}`, `send_${m.id}`).row();
+      const size = m.size ? ` | ${formatFileSize(m.size)}` : '';
+      kb = kb.text(`⬇️ ${m.name} ${m.year || ''} | ${m.language || 'N/A'} | ${m.quality}${size}`, `send_${m.id}`).row();
     }));
     return sendTempMessage(ctx, `❌ Not found. Did you mean *${suggestion}*?`, { parse_mode: 'Markdown', reply_markup: kb });
   }
@@ -568,12 +572,12 @@ bot.on('callback_query:data', async (ctx) => {
     if (!movie) return ctx.answerCallbackQuery({ text: 'Not found', show_alert: true });
     const size = movie.size ? ` | ${formatFileSize(movie.size)}` : '';
     const sent = await ctx.replyWithVideo(movie.file_id, {
-      caption: `🎬 ${movie.name} ${movie.year || ''}\n🌐 ${movie.language} | 📺 ${movie.quality}${size}\n\n⚠️ Auto-delete in 2 min.`,
+      caption: `🎬 ${movie.name} ${movie.year || ''}\n🌐 ${movie.language} | 📺 ${movie.quality}${size}\n\n⚠️ Auto-delete in 10 min.`,
       reply_markup: new InlineKeyboard()
         .url('💬 Join Group', 'https://t.me/cineradarai')
         .url('📸 Instagram', 'https://instagram.com/...')
     });
-    // Auto-delete the sent video
+    // Auto-delete the sent video after 10 minutes
     setTimeout(() => {
       ctx.api.deleteMessage(ctx.chat.id, sent.message_id).catch(() => {});
     }, AUTO_DELETE_DELAY);
@@ -625,7 +629,7 @@ bot.on('callback_query:data', async (ctx) => {
     let kb = new InlineKeyboard();
     grouped.forEach(g => g.items.forEach(m => {
       const size = m.size ? ` | ${formatFileSize(m.size)}` : '';
-      kb = kb.text(`⬇️ ${m.quality}${size}`, `send_${m.id}`).row();
+      kb = kb.text(`⬇️ ${m.name} ${m.year || ''} | ${m.language || 'N/A'} | ${m.quality}${size}`, `send_${m.id}`).row();
     }));
     const filterRows = buildFilterButtons(fullQuery, results);
     filterRows.forEach(row => kb.row(...row));

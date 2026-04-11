@@ -12,7 +12,7 @@ const BOT_TOKEN   = process.env.BOT_TOKEN;
 const OMDB_API_KEY = process.env.OMDB_API_KEY;
 const ADMIN_ID    = Number(process.env.ADMIN_ID) || 5951923988;
 const CHANNEL     = process.env.CHANNEL || '@cineradarai';
-const AUTO_DELETE  = 5 * 60 * 1000;   // ✅ 5 minutes
+const AUTO_DELETE  = 5 * 60 * 1000;   // 5 minutes
 const WELCOME_GIF = 'https://media.tenor.com/8d9B7xYkZk0AAAAC/welcome.gif';
 const OMDB_BASE   = 'https://www.omdbapi.com/';
 
@@ -25,18 +25,12 @@ if (!OMDB_API_KEY) throw new Error('❌ OMDB_API_KEY missing in .env');
 let movies   = {};
 let requests = [];
 let users    = {};
-let favorites = {};
-let watchlist = {};
-let ratings   = {};
 let banned    = {};
 let adminEditState = {};
 let adminEditMode  = {};
 let movieCounter   = 1;
 
-// track last search query per user for filter callbacks
 const userLastSearch = new Map();
-// track user message IDs so we can delete their own search msg too
-const userMsgToDelete = new Map();
 
 // ═══════════════════════════════════════
 // 🔍 FUSE.JS INDEX
@@ -65,9 +59,6 @@ async function loadDB() {
   movies    = await readJSON('movies.json', {});
   requests  = await readJSON('requests.json', []);
   users     = await readJSON('users.json', {});
-  favorites = await readJSON('favorites.json', {});
-  watchlist = await readJSON('watchlist.json', {});
-  ratings   = await readJSON('ratings.json', {});
   banned    = await readJSON('banned.json', {});
 
   // Migration: ensure all movies have short m_N IDs
@@ -99,9 +90,6 @@ async function loadDB() {
 async function saveDB()       { await writeJSON('movies.json', movies); rebuildFuseIndex(); }
 async function saveRequests() { await writeJSON('requests.json', requests); }
 async function saveUsers()    { await writeJSON('users.json', users); }
-async function saveFavorites(){ await writeJSON('favorites.json', favorites); }
-async function saveWatchlist(){ await writeJSON('watchlist.json', watchlist); }
-async function saveRatings()  { await writeJSON('ratings.json', ratings); }
 async function saveBanned()   { await writeJSON('banned.json', banned); }
 
 // ═══════════════════════════════════════
@@ -112,14 +100,12 @@ function sanitize(str) {
   return str.replace(/[<>]/g, '').trim().slice(0, 200);
 }
 
-// ✅ Format size: shows "1.2 GB" or "700 MB"
 function fmtSize(bytes) {
   if (!bytes) return '';
   const mb = bytes / (1024 * 1024);
   return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`;
 }
 
-// ✅ Build the download button label: "Dhurandhar 2025 | Hindi | 1080p | 3.2 GB"
 function movieBtnLabel(m) {
   const parts = [m.name];
   if (m.year)     parts.push(m.year);
@@ -128,30 +114,20 @@ function movieBtnLabel(m) {
   parts.push('|');
   parts.push(m.quality  || 'N/A');
   if (m.size)     parts.push('| ' + fmtSize(m.size));
-  // Telegram button text max ~64 chars
   return `⬇️ ${parts.join(' ')}`.slice(0, 60);
 }
 
-function avgRating(movieId) {
-  const r = ratings[movieId];
-  if (!r || !r.count) return null;
-  return (r.total / r.count).toFixed(1);
-}
-
-// ✅ Schedule deletion of one or more messages after AUTO_DELETE ms
 function scheduleDelete(api, chatId, ...msgIds) {
   setTimeout(() => {
     msgIds.forEach(id => api.deleteMessage(chatId, id).catch(() => {}));
   }, AUTO_DELETE);
 }
 
-// Send a message AND schedule it for deletion (+ optionally delete user msg)
 async function tempReply(ctx, text, options = {}) {
   try {
     const msg = await ctx.reply(text, options);
     const chatId = ctx.chat.id;
     const userMsgId = ctx.message?.message_id;
-    // delete bot reply + user's original message after 5 min
     scheduleDelete(ctx.api, chatId, msg.message_id, ...(userMsgId ? [userMsgId] : []));
     return msg;
   } catch (e) {
@@ -217,7 +193,6 @@ function rateLimit(ctx, next) {
   return next();
 }
 
-// Ban check
 function banCheck(ctx, next) {
   if (banned[ctx.from?.id]) return ctx.reply('🚫 You are banned.');
   return next();
@@ -267,8 +242,7 @@ function groupMovies(list) {
 }
 
 // ═══════════════════════════════════════
-// ✅ FILTER BUTTONS — only show values that exist in results
-// Shows year/language/quality options as filter chips
+// 🔘 FILTER BUTTONS
 // ═══════════════════════════════════════
 function buildFilterKeyboard(query, results) {
   const years = [...new Set(results.map(m => m.year).filter(Boolean))].sort().reverse();
@@ -295,31 +269,6 @@ function buildFilterKeyboard(query, results) {
   return kb;
 }
 
-// ✅ Build download-only keyboard for a list of movies
-function buildDownloadKeyboard(movieList, userId) {
-  const kb = new InlineKeyboard();
-  movieList.forEach(m => {
-    kb.text(movieBtnLabel(m), `send_${m.id}`).row();
-    // fav + watchlist + rate on same row
-    const isFav = (favorites[userId]||[]).includes(m.id);
-    const inWL  = (watchlist[userId] ||[]).includes(m.id);
-    kb.text(isFav ? '💔 Fav' : '❤️ Fav', `fav_${m.id}`)
-      .text(inWL  ? '✅ WL'  : '📋 WL',  `wl_${m.id}`)
-      .text('⭐ Rate', `rate_${m.id}`)
-      .row();
-  });
-  return kb;
-}
-
-// Trending / Recent helpers
-function getTrending(n = 8) {
-  return Object.values(movies).filter(m => m.downloads > 0)
-    .sort((a,b) => (b.downloads||0) - (a.downloads||0)).slice(0, n);
-}
-function getRecent(n = 8) {
-  return Object.values(movies).sort((a,b) => (b.shortId||0) - (a.shortId||0)).slice(0, n);
-}
-
 // ═══════════════════════════════════════
 // 🤖 BOT INIT
 // ═══════════════════════════════════════
@@ -333,19 +282,11 @@ loadDB().then(() => console.log('📀 DB loaded'));
 // ═══════════════════════════════════════
 // 🟢 COMMANDS
 // ═══════════════════════════════════════
-
 bot.command('start', async ctx => {
   trackUser(ctx.from.id, ctx.from.first_name, ctx.from.username);
-  const kb = new InlineKeyboard()
-    .text('🔥 Trending', 'menu_trending').text('🆕 Recent', 'menu_recent').row()
-    .text('❤️ Favorites', 'menu_favorites').text('📋 Watchlist', 'menu_watchlist').row()
-    .text('ℹ️ Help', 'menu_help');
   await tempAnim(ctx, WELCOME_GIF, {
-    caption: `🎬 *Welcome to CineRadar AI, ${ctx.from.first_name}!*\n\n` +
-             `🔍 Type any movie name to search.\n` +
-             `⏱️ All messages auto-delete in 5 minutes.\n\n` +
-             `👇 Use the menu or just type a movie name:`,
-    parse_mode: 'Markdown', reply_markup: kb
+    caption: `🎬 *Welcome to CineRadar AI, ${ctx.from.first_name}!*\n\n🔍 Type movie name (min 3 chars) to search.\n⏱️ Messages auto-delete in 5 minutes.`,
+    parse_mode: 'Markdown'
   });
 });
 
@@ -354,69 +295,9 @@ bot.command('help', async ctx => {
     `🎬 *CineRadar AI — Help*\n\n` +
     `🔍 *Search:* Type movie name (min 3 chars)\n` +
     `📺 *Filters:* Year / Language / Quality buttons appear after search\n` +
-    `❤️ *Favorites:* Tap ❤️ Fav on any movie\n` +
-    `📋 *Watchlist:* Tap 📋 WL on any movie\n` +
-    `⭐ *Rate:* Tap ⭐ Rate on any movie\n` +
     `📩 *Request:* Button appears if movie not found\n\n` +
-    `*/trending* — Most downloaded\n` +
-    `*/recent* — Latest uploads\n` +
-    `*/random* — Random surprise 🎲\n` +
-    `*/favorites* — Your saved movies\n` +
-    `*/watchlist* — Your watchlist\n` +
-    `*/profile* — Your stats\n` +
     `*/myrequests* — Track your requests`,
     { parse_mode: 'Markdown' });
-});
-
-bot.command('trending', async ctx => {
-  const list = getTrending();
-  if (!list.length) return tempReply(ctx, '📭 No trending movies yet.');
-  const kb = buildDownloadKeyboard(list, ctx.from.id);
-  await tempReply(ctx, '🔥 *Trending — Most Downloaded*', { parse_mode: 'Markdown', reply_markup: kb });
-});
-
-bot.command('recent', async ctx => {
-  const list = getRecent();
-  if (!list.length) return tempReply(ctx, '📭 No movies yet.');
-  const kb = buildDownloadKeyboard(list, ctx.from.id);
-  await tempReply(ctx, '🆕 *Recently Added*', { parse_mode: 'Markdown', reply_markup: kb });
-});
-
-bot.command('random', async ctx => {
-  const list = Object.values(movies);
-  if (!list.length) return tempReply(ctx, '📭 No movies in database.');
-  const m = list[Math.floor(Math.random() * list.length)];
-  const avg = avgRating(m.id);
-  const kb = new InlineKeyboard()
-    .text(movieBtnLabel(m), `send_${m.id}`).row()
-    .text('❤️ Fav', `fav_${m.id}`).text('📋 WL', `wl_${m.id}`).text('⭐ Rate', `rate_${m.id}`);
-  await tempReply(ctx,
-    `🎲 *Random Pick!*\n\n` +
-    `🎬 *${m.name}* (${m.year||'?'})\n` +
-    `🌐 ${m.language||'N/A'} | 📺 ${m.quality||'N/A'}${m.size ? ' | '+fmtSize(m.size) : ''}` +
-    (avg ? `\n⭐ ${avg}/5` : ''),
-    { parse_mode: 'Markdown', reply_markup: kb });
-});
-
-bot.command('favorites', async ctx => {
-  const uid = ctx.from.id;
-  const favs = (favorites[uid]||[]).filter(id => movies[id]);
-  if (!favs.length) return tempReply(ctx, '💔 No favorites yet! Search a movie and tap ❤️ Fav.');
-  const kb = buildDownloadKeyboard(favs.map(id => movies[id]), uid);
-  await tempReply(ctx, `❤️ *Your Favorites (${favs.length})*`, { parse_mode: 'Markdown', reply_markup: kb });
-});
-
-bot.command('watchlist', async ctx => {
-  const uid = ctx.from.id;
-  const wl = (watchlist[uid]||[]).filter(id => movies[id]);
-  if (!wl.length) return tempReply(ctx, '📋 Watchlist empty! Search a movie and tap 📋 WL.');
-  const kb = new InlineKeyboard();
-  wl.forEach(id => {
-    const m = movies[id];
-    kb.text(movieBtnLabel(m), `send_${m.id}`).row();
-    kb.text('❌ Remove from WL', `wl_rm_${m.id}`).row();
-  });
-  await tempReply(ctx, `📋 *Your Watchlist (${wl.length})*`, { parse_mode: 'Markdown', reply_markup: kb });
 });
 
 bot.command('myrequests', async ctx => {
@@ -427,24 +308,6 @@ bot.command('myrequests', async ctx => {
   reqs.slice(-10).forEach((r,i) => {
     txt += `${i+1}. 🎬 ${r.movie}\n   ${r.status||'Pending'} — ${new Date(r.time).toLocaleDateString()}\n`;
   });
-  await tempReply(ctx, txt, { parse_mode: 'Markdown' });
-});
-
-bot.command('profile', async ctx => {
-  const uid = ctx.from.id;
-  const u = users[uid];
-  if (!u) return tempReply(ctx, '❌ Profile not found.');
-  const txt =
-    `👤 *Your Profile*\n\n` +
-    `🆔 \`${uid}\`\n` +
-    `📛 ${u.first_name}\n` +
-    `🔗 ${u.username ? '@'+u.username : 'N/A'}\n` +
-    `📅 Joined: ${new Date(u.first_seen).toLocaleDateString()}\n` +
-    `⬇️ Downloads: ${u.downloads||0}\n` +
-    `🔍 Searches: ${u.search_count||0}\n` +
-    `❤️ Favorites: ${(favorites[uid]||[]).length}\n` +
-    `📋 Watchlist: ${(watchlist[uid]||[]).length}\n` +
-    `📩 Requests: ${requests.filter(r=>r.user===uid).length}`;
   await tempReply(ctx, txt, { parse_mode: 'Markdown' });
 });
 
@@ -535,6 +398,41 @@ bot.command('search', async ctx => {
 });
 
 // ═══════════════════════════════════════
+// 👋 WELCOME NEW GROUP MEMBERS (FIXED)
+// ═══════════════════════════════════════
+bot.on('message:new_chat_members', async ctx => {
+  const chatId = ctx.chat.id;
+  const newMembers = ctx.message.new_chat_members;
+  for (let member of newMembers) {
+    if (member.id === ctx.me.id) continue;
+    const firstName = member.first_name;
+    const welcomeMsg = `👋 Welcome ${firstName}!\n\n🎬 *CineRadar AI* me aapka swagat hai.\n📌 Movie paane ke liye bas movie ka naam type karein (minimum 3 letters).\n🔍 Example: *Krish*\n\n🔥 Enjoy HD Movies!`;
+    try {
+      await ctx.api.sendMessage(chatId, welcomeMsg, { parse_mode: 'Markdown' });
+    } catch (e) {
+      console.error('Group welcome error:', e.message);
+    }
+  }
+});
+
+// ═══════════════════════════════════════
+// 🤖 BOT ADDED TO GROUP WELCOME
+// ═══════════════════════════════════════
+bot.on('my_chat_member', async ctx => {
+  const chatId = ctx.chat.id;
+  const newStatus = ctx.update.my_chat_member.new_chat_member.status;
+  const oldStatus = ctx.update.my_chat_member.old_chat_member.status;
+  if (newStatus === 'member' && oldStatus !== 'member') {
+    const welcomeMsg = `🤖 *CineRadar AI is now active in this group!*\n\n🎬 Members can search movies by typing the movie name (minimum 3 letters).\n📌 Example: *Krrish*\n\n🔞 No 18+ content allowed.\n👑 Admin contact: @cineradarai_admin`;
+    try {
+      await ctx.api.sendMessage(chatId, welcomeMsg, { parse_mode: 'Markdown' });
+    } catch (e) {
+      console.error('Bot added welcome error:', e.message);
+    }
+  }
+});
+
+// ═══════════════════════════════════════
 // 📨 MESSAGE HANDLER
 // ═══════════════════════════════════════
 bot.on('message', async (ctx, next) => {
@@ -619,10 +517,8 @@ bot.on('message', async (ctx, next) => {
   const query = sanitize(msg.text.toLowerCase());
   userLastSearch.set(userId, query);
 
-  // Update search count
   if (users[userId]) { users[userId].search_count = (users[userId].search_count||0)+1; saveUsers(); }
 
-  // Channel join check
   if (!isAdmin && !(await isJoined(userId, ctx))) {
     const kb = new InlineKeyboard().url('📢 Join Channel', `https://t.me/${CHANNEL.replace('@','')}`);
     return tempReply(ctx, '🚫 Please join our channel first!', { reply_markup: kb });
@@ -632,7 +528,6 @@ bot.on('message', async (ctx, next) => {
   const omdb = await fetchOMDb(query);
 
   if (omdb && omdb.Poster && omdb.Poster !== 'N/A') {
-    // Build caption
     let caption = `🎬 *${omdb.Title}* (${omdb.Year})\n`;
     if (omdb.Genre    && omdb.Genre    !== 'N/A') caption += `🎭 ${omdb.Genre}\n`;
     if (omdb.imdbRating !== 'N/A')               caption += `⭐ IMDb: ${omdb.imdbRating}/10\n`;
@@ -640,39 +535,24 @@ bot.on('message', async (ctx, next) => {
     if (omdb.Director && omdb.Director !== 'N/A') caption += `🎥 ${omdb.Director}\n`;
     if (omdb.Plot     && omdb.Plot     !== 'N/A') caption += `\n📖 ${omdb.Plot}\n`;
 
-    // Search DB for matching movies
     const matches = searchMovies(omdb.Title);
 
     if (matches.length > 0) {
-      // ✅ MOVIE EXISTS — show full detail download buttons + filters
       caption += `\n✅ *Available — ${matches.length} version(s)*`;
-
       const kb = new InlineKeyboard();
       matches.forEach(m => {
-        // Full detail button: "⬇️ Dhurandhar 2025 | Hindi | 1080p | 3.2 GB"
         kb.text(movieBtnLabel(m), `send_${m.id}`).row();
-        const isFav = (favorites[userId]||[]).includes(m.id);
-        const inWL  = (watchlist[userId] ||[]).includes(m.id);
-        const avg   = avgRating(m.id);
-        kb.text(isFav?'💔 Fav':'❤️ Fav', `fav_${m.id}`)
-          .text(inWL ?'✅ WL' :'📋 WL',  `wl_${m.id}`)
-          .text(avg  ? `⭐${avg}`:'⭐ Rate', `rate_${m.id}`)
-          .row();
+        if (isAdmin && adminEditMode[userId]) {
+          kb.text(`✏️ Edit "${m.name}"`, `edit_${m.id}`).row();
+        }
       });
-
-      // Add filter chips if multiple versions
       if (matches.length > 1) {
         const fkb = buildFilterKeyboard(query, matches);
-        // merge filter rows into kb
-        caption += `\n🔽 *Filter by quality / language / year:*`;
-        return tempPhoto(ctx, omdb.Poster, { caption, parse_mode: 'Markdown',
-          reply_markup: mergeKeyboards(kb, fkb) });
+        caption += `\n🔽 *Filter:*`;
+        return tempPhoto(ctx, omdb.Poster, { caption, parse_mode: 'Markdown', reply_markup: mergeKeyboards(kb, fkb) });
       }
-
       return tempPhoto(ctx, omdb.Poster, { caption, parse_mode: 'Markdown', reply_markup: kb });
-
     } else {
-      // ✅ MOVIE NOT IN DB — show OMDb poster + request button + join channel
       caption += `\n❌ *Not available yet.*\n📩 Request below — admin will upload!`;
       const kb = new InlineKeyboard()
         .text('📩 Request This Movie', `request_${encodeURIComponent(omdb.Title)}`).row()
@@ -681,33 +561,22 @@ bot.on('message', async (ctx, next) => {
     }
   }
 
-  // ── Fallback: no OMDb poster — local search only ──
+  // Fallback local search
   const results = searchMovies(query);
-
   if (results.length > 0) {
     let txt = `🎬 *Found ${results.length} result(s) for "${sanitize(msg.text)}"*\n\n`;
     const grouped = groupMovies(results);
-    grouped.forEach(g => {
-      txt += `• *${g.displayName}* ${g.year||''}\n`;
-    });
+    grouped.forEach(g => { txt += `• *${g.displayName}* ${g.year||''}\n`; });
     txt += `\n🔽 *Tap to download:*`;
 
-    // Build full-detail download keyboard
     const kb = new InlineKeyboard();
     results.forEach(m => {
       kb.text(movieBtnLabel(m), `send_${m.id}`).row();
-      const isFav = (favorites[userId]||[]).includes(m.id);
-      const inWL  = (watchlist[userId] ||[]).includes(m.id);
-      kb.text(isFav?'💔 Fav':'❤️ Fav', `fav_${m.id}`)
-        .text(inWL ?'✅ WL' :'📋 WL',  `wl_${m.id}`)
-        .text('⭐ Rate', `rate_${m.id}`)
-        .row();
       if (isAdmin && adminEditMode[userId]) {
-        kb.text(`✏️ Edit`, `edit_${m.id}`).row();
+        kb.text(`✏️ Edit "${m.name}"`, `edit_${m.id}`).row();
       }
     });
 
-    // Filter chips if multiple results
     if (results.length > 1) {
       const fkb = buildFilterKeyboard(query, results);
       txt += `\n\n🔽 *Filter:*`;
@@ -716,7 +585,6 @@ bot.on('message', async (ctx, next) => {
     return tempReply(ctx, txt, { parse_mode: 'Markdown', reply_markup: kb });
   }
 
-  // ── Fuzzy suggestion ──
   const suggestion = fuzzyMatch(query);
   if (suggestion) {
     const sugResults = searchMovies(suggestion);
@@ -728,8 +596,6 @@ bot.on('message', async (ctx, next) => {
     }
   }
 
-  // ── Not found — show request + join ──
-  // Try OMDb anyway for a poster even if no local match
   const omdbFallback = await fetchOMDb(query);
   if (omdbFallback && omdbFallback.Poster && omdbFallback.Poster !== 'N/A') {
     let caption = `🎬 *${omdbFallback.Title}* (${omdbFallback.Year})\n`;
@@ -748,23 +614,14 @@ bot.on('message', async (ctx, next) => {
     { parse_mode: 'Markdown', reply_markup: kb });
 });
 
-// ═══════════════════════════════════════
-// 🔧 MERGE TWO INLINE KEYBOARDS
-// ═══════════════════════════════════════
 function mergeKeyboards(kb1, kb2) {
-  // grammY InlineKeyboard stores rows as kb.inline_keyboard
   const merged = new InlineKeyboard();
   const rows1 = kb1.inline_keyboard || [];
   const rows2 = kb2.inline_keyboard || [];
-  [...rows1, ...rows2].forEach(row => {
-    merged.row(...row);
-  });
+  [...rows1, ...rows2].forEach(row => merged.row(...row));
   return merged;
 }
 
-// ═══════════════════════════════════════
-// 🔧 FINISH UPLOAD HELPER
-// ═══════════════════════════════════════
 async function finishUpload(ctx, state) {
   const key = `m_${movieCounter}`;
   movies[key] = {
@@ -798,7 +655,7 @@ bot.on('callback_query:data', async ctx => {
   const data   = ctx.callbackQuery.data;
   const userId = ctx.from.id;
 
-  // ── Upload: language ──
+  // Upload language
   if (data.startsWith('ul_lang_')) {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     if (!ctx.session.upload) return ctx.answerCallbackQuery({ text: '❌ No active upload session' });
@@ -813,7 +670,7 @@ bot.on('callback_query:data', async ctx => {
     return ctx.reply('📺 *Step 4/4:* Select quality:', { parse_mode: 'Markdown', reply_markup: kb });
   }
 
-  // ── Upload: quality → save ──
+  // Upload quality → save
   if (data.startsWith('ul_qual_')) {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const state = ctx.session.upload;
@@ -823,29 +680,21 @@ bot.on('callback_query:data', async ctx => {
     return finishUpload(ctx, state);
   }
 
-  // ── Send movie (DOWNLOAD) ──
+  // Send movie
   if (data.startsWith('send_')) {
     const movieId = data.slice('send_'.length);
     const m = movies[movieId];
     if (!m) return ctx.answerCallbackQuery({ text: '❌ Movie not found', show_alert: true });
 
-    // Increment download counters
     m.downloads = (m.downloads||0) + 1;
     if (users[userId]) users[userId].downloads = (users[userId].downloads||0) + 1;
     saveDB(); saveUsers();
 
-    const avg = avgRating(movieId);
-    const caption =
-      `🎬 *${m.name}* (${m.year||'?'})\n` +
-      `🌐 ${m.language||'N/A'} | 📺 ${m.quality||'N/A'}${m.size?' | '+fmtSize(m.size):''}\n` +
-      (avg ? `⭐ User Rating: ${avg}/5\n` : '') +
-      `\n⏱️ *Auto-deletes in 5 minutes.*`;
-
+    const caption = `🎬 *${m.name}* (${m.year||'?'})\n🌐 ${m.language||'N/A'} | 📺 ${m.quality||'N/A'}${m.size?' | '+fmtSize(m.size):''}\n\n⏱️ *Auto-deletes in 5 minutes.*`;
     try {
       const sent = await ctx.replyWithVideo(m.file_id, {
         caption, parse_mode: 'Markdown',
-        reply_markup: new InlineKeyboard()
-          .url('💬 Join Channel', `https://t.me/${CHANNEL.replace('@','')}`)
+        reply_markup: new InlineKeyboard().url('💬 Join Channel', `https://t.me/${CHANNEL.replace('@','')}`)
       });
       scheduleDelete(ctx.api, ctx.chat.id, sent.message_id);
       return ctx.answerCallbackQuery({ text: `📥 ${m.name}` });
@@ -855,63 +704,7 @@ bot.on('callback_query:data', async ctx => {
     }
   }
 
-  // ── Favorites toggle ──
-  if (data.startsWith('fav_')) {
-    const mid = data.slice('fav_'.length);
-    if (!movies[mid]) return ctx.answerCallbackQuery({ text: '❌ Movie not found' });
-    if (!favorites[userId]) favorites[userId] = [];
-    const idx = favorites[userId].indexOf(mid);
-    if (idx === -1) { favorites[userId].push(mid); await saveFavorites();
-      return ctx.answerCallbackQuery({ text: `❤️ Added to favorites!` }); }
-    else { favorites[userId].splice(idx,1); await saveFavorites();
-      return ctx.answerCallbackQuery({ text: `💔 Removed from favorites` }); }
-  }
-
-  // ── Watchlist toggle ──
-  if (data.startsWith('wl_rm_')) {
-    const mid = data.slice('wl_rm_'.length);
-    if (!watchlist[userId]) watchlist[userId] = [];
-    watchlist[userId] = watchlist[userId].filter(id => id !== mid);
-    await saveWatchlist();
-    return ctx.answerCallbackQuery({ text: '✅ Removed from watchlist' });
-  }
-  if (data.startsWith('wl_')) {
-    const mid = data.slice('wl_'.length);
-    if (!movies[mid]) return ctx.answerCallbackQuery({ text: '❌ Movie not found' });
-    if (!watchlist[userId]) watchlist[userId] = [];
-    const idx = watchlist[userId].indexOf(mid);
-    if (idx === -1) { watchlist[userId].push(mid); await saveWatchlist();
-      return ctx.answerCallbackQuery({ text: `📋 Added to watchlist!` }); }
-    else { watchlist[userId].splice(idx,1); await saveWatchlist();
-      return ctx.answerCallbackQuery({ text: `✅ Removed from watchlist` }); }
-  }
-
-  // ── Rating: show star picker ──
-  if (data.startsWith('rate_')) {
-    const mid = data.slice('rate_'.length);
-    if (!movies[mid]) return ctx.answerCallbackQuery({ text: '❌ Movie not found' });
-    const kb = new InlineKeyboard()
-      .text('1⭐','dr_'+mid+'_1').text('2⭐','dr_'+mid+'_2').text('3⭐','dr_'+mid+'_3')
-      .text('4⭐','dr_'+mid+'_4').text('5⭐','dr_'+mid+'_5');
-    await ctx.reply(`⭐ Rate *${movies[mid].name}*:`, { parse_mode: 'Markdown', reply_markup: kb });
-    return ctx.answerCallbackQuery();
-  }
-  // ── Rating: submit ──
-  if (data.startsWith('dr_')) {
-    const [,mid,scoreStr] = data.split('_');
-    const score = parseInt(scoreStr);
-    if (!movies[mid] || isNaN(score)) return ctx.answerCallbackQuery({ text: '❌ Invalid' });
-    if (!ratings[mid]) ratings[mid] = { total:0, count:0, voters:{} };
-    const r = ratings[mid];
-    if (r.voters[userId]) { r.total -= r.voters[userId]; r.count--; }
-    r.voters[userId] = score; r.total += score; r.count++;
-    await saveRatings();
-    const avg = (r.total/r.count).toFixed(1);
-    return ctx.answerCallbackQuery({ text: `✅ Rated ${score}⭐ — Avg: ${avg}/5`, show_alert: true });
-  }
-
-  // ── ✅ FILTER BUTTONS — parse with pipe separator ──
-  // Format: f|query|type|value
+  // Filters (f|query|type|value)
   if (data.startsWith('f|')) {
     const parts = data.split('|');
     if (parts.length < 4) return ctx.answerCallbackQuery();
@@ -926,29 +719,22 @@ bot.on('callback_query:data', async ctx => {
     const results = type === 'all' ? searchMovies(fullQuery) : searchMovies(fullQuery, filters);
     if (!results.length) return ctx.answerCallbackQuery({ text: 'No results for this filter', show_alert: true });
 
-    // Rebuild full detail keyboard
     const kb = new InlineKeyboard();
     results.forEach(m => {
       kb.text(movieBtnLabel(m), `send_${m.id}`).row();
-      const isFav = (favorites[userId]||[]).includes(m.id);
-      const inWL  = (watchlist[userId] ||[]).includes(m.id);
-      kb.text(isFav?'💔 Fav':'❤️ Fav', `fav_${m.id}`)
-        .text(inWL ?'✅ WL' :'📋 WL',  `wl_${m.id}`)
-        .text('⭐ Rate', `rate_${m.id}`)
-        .row();
+      if (userId === ADMIN_ID && adminEditMode[userId]) {
+        kb.text(`✏️ Edit "${m.name}"`, `edit_${m.id}`).row();
+      }
     });
 
-    // Add updated filter chips
     const fkb = buildFilterKeyboard(fullQuery, results);
     const merged = mergeKeyboards(kb, fkb);
 
-    try { await ctx.editMessageReplyMarkup({ reply_markup: merged }); }
-    catch { /* photo message — try edit caption */ }
-
+    try { await ctx.editMessageReplyMarkup({ reply_markup: merged }); } catch {}
     return ctx.answerCallbackQuery({ text: `${results.length} result(s)` });
   }
 
-  // ── Old filter_ format (backwards compat) ──
+  // Old filter_ format
   if (data.startsWith('filter_')) {
     const firstPipe = data.indexOf('|');
     const secondPipe = data.indexOf('|', firstPipe+1);
@@ -969,30 +755,21 @@ bot.on('callback_query:data', async ctx => {
     return ctx.answerCallbackQuery({ text: `${results.length} result(s)` });
   }
 
-  // ── Request movie ──
+  // Request movie
   if (data.startsWith('request_')) {
     const movieName = decodeURIComponent(data.slice('request_'.length));
-    const already = requests.find(r =>
-      r.user === userId &&
-      r.movie.toLowerCase() === movieName.toLowerCase() &&
-      (!r.status || r.status === 'Pending')
-    );
+    const already = requests.find(r => r.user === userId && r.movie.toLowerCase() === movieName.toLowerCase() && (!r.status || r.status === 'Pending'));
     if (already) return ctx.answerCallbackQuery({ text: '⚠️ Already requested!', show_alert: true });
     requests.push({ user: userId, movie: movieName, time: new Date().toISOString(), status: 'Pending' });
     await saveRequests();
-    await ctx.reply(
-      `✅ *Request sent for "${movieName}"!*\n\nAdmin has been notified. Use /myrequests to track.`,
-      { parse_mode: 'Markdown' }
-    );
+    await ctx.reply(`✅ *Request sent for "${movieName}"!*\n\nAdmin has been notified. Use /myrequests to track.`, { parse_mode: 'Markdown' });
     try {
-      await ctx.api.sendMessage(ADMIN_ID,
-        `📩 *New Request*\n\n🎬 ${movieName}\n👤 User: ${userId} (@${ctx.from.username||'N/A'})\n\nUse /pending to manage.`,
-        { parse_mode: 'Markdown' });
+      await ctx.api.sendMessage(ADMIN_ID, `📩 *New Request*\n\n🎬 ${movieName}\n👤 User: ${userId} (@${ctx.from.username||'N/A'})\n\nUse /pending to manage.`, { parse_mode: 'Markdown' });
     } catch {}
     return ctx.answerCallbackQuery({ text: '✅ Request sent!' });
   }
 
-  // ── Admin: fulfill request ──
+  // Admin fulfill request
   if (data.startsWith('req_done_')) {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const rest     = data.slice('req_done_'.length);
@@ -1002,14 +779,12 @@ bot.on('callback_query:data', async ctx => {
     const req = requests.find(r => String(r.user)===String(reqUser) && r.movie===movieName);
     if (req) {
       req.status = 'Fulfilled'; await saveRequests();
-      try { await ctx.api.sendMessage(reqUser,
-        `✅ Your request for *${movieName}* has been fulfilled! Search it now. 🎬`,
-        { parse_mode: 'Markdown' }); } catch {}
+      try { await ctx.api.sendMessage(reqUser, `✅ Your request for *${movieName}* has been fulfilled! Search it now. 🎬`, { parse_mode: 'Markdown' }); } catch {}
     }
     return ctx.answerCallbackQuery({ text: '✅ Marked fulfilled' });
   }
 
-  // ── Admin edit: choose movie ──
+  // ─── ADMIN EDIT FLOW ─────────────────────────────────────
   if (data.startsWith('edit_')) {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const mid = data.slice('edit_'.length);
@@ -1017,12 +792,13 @@ bot.on('callback_query:data', async ctx => {
     if (!m) return ctx.answerCallbackQuery({ text: '❌ Not found' });
     adminEditState[ctx.chat.id] = { movieId: mid, step: 'choose_field' };
     const kb = new InlineKeyboard()
-      .text('📝 Name','ef_name').text('📅 Year','ef_year').row()
-      .text('🌐 Language','ef_lang').text('📺 Quality','ef_qual').row()
-      .text('💾 Size','ef_size').text('❌ Cancel','ef_cancel');
+      .text('📝 Name', 'ef_name').text('📅 Year', 'ef_year').row()
+      .text('🌐 Language', 'ef_lang').text('📺 Quality', 'ef_qual').row()
+      .text('💾 Size', 'ef_size').text('❌ Cancel', 'ef_cancel');
     await ctx.reply(`✏️ Editing: *${m.name}*\nChoose field:`, { parse_mode: 'Markdown', reply_markup: kb });
     return ctx.answerCallbackQuery();
   }
+
   if (data.startsWith('ef_')) {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const field = data.slice('ef_'.length);
@@ -1037,54 +813,11 @@ bot.on('callback_query:data', async ctx => {
     return ctx.answerCallbackQuery();
   }
 
-  // ── Menu buttons ──
-  if (data === 'menu_trending') {
-    const list = getTrending(8);
-    if (!list.length) return ctx.answerCallbackQuery({ text: '📭 No trending yet', show_alert: true });
-    const kb = buildDownloadKeyboard(list, userId);
-    await ctx.reply('🔥 *Trending Movies*', { parse_mode: 'Markdown', reply_markup: kb });
-    return ctx.answerCallbackQuery();
-  }
-  if (data === 'menu_recent') {
-    const list = getRecent(8);
-    if (!list.length) return ctx.answerCallbackQuery({ text: '📭 No movies yet', show_alert: true });
-    const kb = buildDownloadKeyboard(list, userId);
-    await ctx.reply('🆕 *Recently Added*', { parse_mode: 'Markdown', reply_markup: kb });
-    return ctx.answerCallbackQuery();
-  }
-  if (data === 'menu_favorites') {
-    const favs = (favorites[userId]||[]).filter(id => movies[id]);
-    if (!favs.length) return ctx.answerCallbackQuery({ text: '💔 No favorites yet!', show_alert: true });
-    const kb = buildDownloadKeyboard(favs.map(id=>movies[id]), userId);
-    await ctx.reply(`❤️ *Favorites (${favs.length})*`, { parse_mode: 'Markdown', reply_markup: kb });
-    return ctx.answerCallbackQuery();
-  }
-  if (data === 'menu_watchlist') {
-    const wl = (watchlist[userId]||[]).filter(id => movies[id]);
-    if (!wl.length) return ctx.answerCallbackQuery({ text: '📋 Watchlist empty!', show_alert: true });
-    const kb = buildDownloadKeyboard(wl.map(id=>movies[id]), userId);
-    await ctx.reply(`📋 *Watchlist (${wl.length})*`, { parse_mode: 'Markdown', reply_markup: kb });
-    return ctx.answerCallbackQuery();
-  }
-  if (data === 'menu_help') {
-    await ctx.reply(
-      `🎬 *CineRadar AI — Help*\n\n` +
-      `🔍 *Search:* Type movie name (min 3 chars)\n` +
-      `📺 *Filters:* Tap Year/Quality/Language chips to filter\n` +
-      `❤️ *Favorites:* Tap ❤️ Fav on any movie\n` +
-      `📋 *Watchlist:* Tap 📋 WL to save for later\n` +
-      `⭐ *Rate:* Tap ⭐ Rate → pick 1–5 stars\n` +
-      `📩 *Request:* Missing movie? Tap Request!\n\n` +
-      `*/trending /recent /random /favorites\n/watchlist /profile /myrequests*`,
-      { parse_mode: 'Markdown' });
-    return ctx.answerCallbackQuery();
-  }
-
   return ctx.answerCallbackQuery();
 });
 
 // ═══════════════════════════════════════
-// 📅 DAILY SUGGESTIONS (channel post)
+// 📅 DAILY SUGGESTIONS
 // ═══════════════════════════════════════
 const DAILY_FILE = 'lastDailySent.json';
 async function sendDailySuggestions() {
@@ -1099,10 +832,7 @@ async function sendDailySuggestions() {
     for (const m of selected) {
       try {
         await bot.api.sendVideo(CHANNEL, m.file_id, {
-          caption: `🎬 *आज की सुझाई गई मूवी*\n\n` +
-                   `${m.name} (${m.year||'?'})\n` +
-                   `🌐 ${m.language||'N/A'} | 📺 ${m.quality||'N/A'}${m.size?' | '+fmtSize(m.size):''}\n\n` +
-                   `📥 Bot पर जाकर डाउनलोड करें!`,
+          caption: `🎬 *आज की सुझाई गई मूवी*\n\n${m.name} (${m.year||'?'})\n🌐 ${m.language||'N/A'} | 📺 ${m.quality||'N/A'}${m.size?' | '+fmtSize(m.size):''}\n\n📥 Bot पर जाकर डाउनलोड करें!`,
           parse_mode: 'Markdown'
         });
         await new Promise(r => setTimeout(r, 2000));
@@ -1112,7 +842,8 @@ async function sendDailySuggestions() {
     console.log(`✅ Daily suggestions sent for ${today}`);
   } catch (e) { console.error('Daily error:', e); }
 }
-setInterval(sendDailySuggestions, 3600000); // check every hour
+setInterval(sendDailySuggestions, 3600000);
+setTimeout(sendDailySuggestions, 5000);
 
 // ═══════════════════════════════════════
 // 🔄 AUTO GIT PUSH
@@ -1131,13 +862,10 @@ setInterval(gitPush, 60000);
 // ═══════════════════════════════════════
 bot.catch(err => {
   console.error(`❌ Bot error on update ${err.ctx?.update?.update_id}:`, err.error);
-  bot.api.sendMessage(ADMIN_ID,
-    `⚠️ *Bot Error*\n\`\`\`${String(err.error?.message||err.error).slice(0,400)}\`\`\``,
-    { parse_mode: 'Markdown' }).catch(()=>{});
+  bot.api.sendMessage(ADMIN_ID, `⚠️ *Bot Error*\n\`\`\`${String(err.error?.message||err.error).slice(0,400)}\`\`\``, { parse_mode: 'Markdown' }).catch(()=>{});
 });
 
 // ═══════════════════════════════════════
 // 🟢 START
 // ═══════════════════════════════════════
 bot.start({ onStart: info => console.log(`🚀 @${info.username} running — grammY`) });
-

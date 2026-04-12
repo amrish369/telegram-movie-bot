@@ -225,19 +225,18 @@ async function searchOMDb(query, year = '') {
 }
 
 // ═══════════════════════════════════════
-// 🇮🇳 INDIAN MOVIES FETCHERS (BOLLYWOOD + SOUTH)
+// 🇮🇳 INDIAN MOVIES FETCHERS
 // ═══════════════════════════════════════
 const INDIAN_KEYWORDS = [
   'Bollywood', 'Hindi', 'Tamil', 'Telugu', 'Malayalam', 'Kannada',
   'Shah Rukh Khan', 'Salman Khan', 'Aamir Khan', 'Akshay Kumar', 'Ajay Devgn',
-  'Rajinikanth', 'Vijay', 'Ajith', 'Allu Arjun', 'Prabhas', 'Yash', 'Mohanlal', 'Mammootty'
+  'Rajinikanth', 'Vijay', 'Ajith', 'Allu Arjun', 'Prabhas', 'Yash'
 ];
 
 async function getIndianMoviesByType(type = 'new', count = 5) {
   const year = type === 'new' ? new Date().getFullYear() : new Date().getFullYear() + 1;
   const allMovies = [];
   
-  // Search with multiple Indian keywords
   for (const kw of INDIAN_KEYWORDS.slice(0, 8)) {
     const res = await searchOMDb(kw, String(year));
     allMovies.push(...res);
@@ -245,20 +244,13 @@ async function getIndianMoviesByType(type = 'new', count = 5) {
     await new Promise(r => setTimeout(r, 200));
   }
   
-  // Also search with generic "Indian" and year
-  const genericRes = await searchOMDb('Indian', String(year));
-  allMovies.push(...genericRes);
-  
-  // Remove duplicates
   const unique = [...new Map(allMovies.map(m => [m.imdbID, m])).values()];
-  
-  // Get full details and filter Indian movies (check language/country)
   const indianMovies = [];
+  
   for (const m of unique) {
     const details = await fetchOMDb(m.Title);
     if (!details || !details.Poster || details.Poster === 'N/A') continue;
     
-    // Check if Indian (language Hindi/Tamil/Telugu etc. or Country includes India)
     const lang = (details.Language || '').toLowerCase();
     const country = (details.Country || '').toLowerCase();
     const isIndian = 
@@ -272,7 +264,6 @@ async function getIndianMoviesByType(type = 'new', count = 5) {
     }
     await new Promise(r => setTimeout(r, 200));
   }
-  
   return indianMovies;
 }
 
@@ -539,7 +530,6 @@ bot.on('my_chat_member', async ctx => {
     
     try {
       const sent = await ctx.api.sendMessage(chatId, helpText, { parse_mode: 'Markdown' });
-      // Pin the message
       await ctx.api.pinChatMessage(chatId, sent.message_id);
     } catch (e) {
       console.error('Bot added welcome/pin error:', e.message);
@@ -548,7 +538,7 @@ bot.on('my_chat_member', async ctx => {
 });
 
 // ═══════════════════════════════════════
-// 📨 MESSAGE HANDLER
+// 📨 MESSAGE HANDLER (SAME AS BEFORE)
 // ═══════════════════════════════════════
 bot.on('message', async (ctx, next) => {
   const msg    = ctx.message;
@@ -557,7 +547,6 @@ bot.on('message', async (ctx, next) => {
 
   trackUser(userId, msg.from.first_name, msg.from.username);
 
-  // Admin upload
   if (isAdmin && (msg.video || msg.document)) {
     const fileId   = msg.video?.file_id   || msg.document?.file_id;
     const fileSize = msg.video?.file_size || msg.document?.file_size || null;
@@ -756,7 +745,7 @@ async function finishUpload(ctx, state) {
 }
 
 // ═══════════════════════════════════════
-// 🔘 CALLBACK HANDLER
+// 🔘 CALLBACK HANDLER (SAME)
 // ═══════════════════════════════════════
 bot.on('callback_query:data', async ctx => {
   const data   = ctx.callbackQuery.data;
@@ -890,56 +879,76 @@ bot.on('callback_query:data', async ctx => {
 });
 
 // ═══════════════════════════════════════
-// 📅 DAILY AUTO POST (INDIAN MOVIES ONLY)
+// 📅 DAILY AUTO POST (FIXED & FULL)
 // ═══════════════════════════════════════
 const DAILY_FILE = 'lastDailySent.json';
 async function sendDailySuggestions() {
   try {
-    let last = '';
-    try { last = (await fs.readFile(DAILY_FILE,'utf8')).trim(); } catch {}
+    let lastDate = '';
+    try { lastDate = (await fs.readFile(DAILY_FILE, 'utf8')).trim(); } catch {}
     const today = new Date().toISOString().slice(0,10);
-    if (last === today) return;
+    
+    if (lastDate === today) {
+      console.log('[DAILY] Already sent today.');
+      return;
+    }
+
+    console.log('[DAILY] Sending daily post...');
 
     // 1. Send 3 new Indian releases
-    const newMovies = await getIndianMoviesByType('new', 3);
-    for (const m of newMovies) {
-      try {
+    try {
+      const newMovies = await getIndianMoviesByType('new', 3);
+      for (const m of newMovies) {
         await bot.api.sendPhoto(CHANNEL, m.Poster, {
           caption: `🆕 *New Indian Release!*\n\n🎬 ${escapeMarkdown(m.Title)} (${m.Year})\n⭐ IMDb: ${m.imdbRating || 'N/A'}\n📖 ${escapeMarkdown(m.Plot || '')}\n\n📥 Search on bot to request!`,
           parse_mode: 'Markdown'
         });
         await new Promise(r => setTimeout(r, 1000));
-      } catch (e) {}
-    }
+      }
+    } catch (e) { console.error('[DAILY] New movies error:', e); }
 
     // 2. Send 2 upcoming Indian movies
-    const upcomingMovies = await getIndianMoviesByType('upcoming', 2);
-    for (const m of upcomingMovies) {
-      try {
+    try {
+      const upcomingMovies = await getIndianMoviesByType('upcoming', 2);
+      for (const m of upcomingMovies) {
         await bot.api.sendPhoto(CHANNEL, m.Poster, {
           caption: `🔮 *Upcoming Indian Movie!*\n\n🎬 ${escapeMarkdown(m.Title)} (${m.Year})\n⭐ IMDb: ${m.imdbRating || 'N/A'}\n📖 ${escapeMarkdown(m.Plot || '')}\n\n📥 Search on bot to request!`,
           parse_mode: 'Markdown'
         });
         await new Promise(r => setTimeout(r, 1000));
-      } catch (e) {}
-    }
+      }
+    } catch (e) { console.error('[DAILY] Upcoming movies error:', e); }
 
-    // 3. Send 1 random movie from local DB (original feature)
+    // 3. Send 5 random movies from local DB (no repeat - shuffled)
     const list = Object.values(movies);
     if (list.length) {
-      const rand = list[Math.floor(Math.random() * list.length)];
-      await bot.api.sendVideo(CHANNEL, rand.file_id, {
-        caption: `🎬 *आज की सुझाई गई मूवी*\n\n${escapeMarkdown(rand.name)} (${rand.year||'?'})\n🌐 ${rand.language||'N/A'} | 📺 ${rand.quality||'N/A'}${rand.size?' | '+fmtSize(rand.size):''}\n\n📥 Bot पर जाकर डाउनलोड करें!`,
-        parse_mode: 'Markdown'
-      });
+      const shuffled = [...list].sort(() => Math.random() - 0.5);
+      const selected = shuffled.slice(0, Math.min(5, list.length));
+      for (const m of selected) {
+        try {
+          await bot.api.sendVideo(CHANNEL, m.file_id, {
+            caption: `🎬 *आज की सुझाई गई मूवी*\n\n${escapeMarkdown(m.name)} (${m.year||'?'})\n🌐 ${m.language||'N/A'} | 📺 ${m.quality||'N/A'}${m.size?' | '+fmtSize(m.size):''}\n\n📥 Bot पर जाकर डाउनलोड करें!`,
+            parse_mode: 'Markdown'
+          });
+          await new Promise(r => setTimeout(r, 2000));
+        } catch (e) { console.error('[DAILY] Local movie error:', e); }
+      }
     }
 
     await fs.writeFile(DAILY_FILE, today);
-    console.log(`✅ Daily post sent for ${today}`);
-  } catch (e) { console.error('Daily error:', e); }
+    console.log('[DAILY] ✅ Post completed for', today);
+  } catch (e) { console.error('[DAILY] Fatal error:', e); }
 }
-setInterval(sendDailySuggestions, 3600000);
-setTimeout(sendDailySuggestions, 5000);
+
+// Check every hour
+setInterval(() => {
+  sendDailySuggestions().catch(e => console.error('[DAILY] Interval error:', e));
+}, 60 * 60 * 1000);
+
+// Run once at startup (after 5 sec)
+setTimeout(() => {
+  sendDailySuggestions().catch(e => console.error('[DAILY] Startup error:', e));
+}, 5000);
 
 // ═══════════════════════════════════════
 // 🔄 AUTO GIT PUSH

@@ -1,0 +1,67 @@
+[
+  {
+    "date": "2026-04-17",
+    "items": [
+      {
+        "type": "new",
+        "movieData": {
+          "Title": "Bhooth Bangla",
+          "Year": "2026",
+          "Rated": "N/A",
+          "Released": "10 Apr 2026",
+          "Runtime": "N/A",
+          "Genre": "Comedy, Horror",
+          "Director": "Priyadarshan",
+          "Writer": "Aakash Kaushik, Abilash Nair, Priyadarshan",
+          "Actors": "Akshay Kumar, Paresh Rawal, Tabu",
+          "Plot": "Bhooth Bangla is an upcoming horror-comedy film starring Akshay Kumar, directed by Priyadarshan.",
+          "Language": "Hindi",
+          "Country": "India",
+          "Awards": "N/A",
+          "Poster": "https://m.media-amazon.com/images/M/MV5BNGUwZWJkNWEtMTAwMi00MTliLWJlYTUtMmJjYzgyMzMyMzZmXkEyXkFqcGc@._V1_SX300.jpg",
+          "Ratings": [],
+          "Metascore": "N/A",
+          "imdbRating": "N/A",
+          "imdbVotes": "N/A",
+          "imdbID": "tt29540862",
+          "Type": "movie",
+          "DVD": "N/A",
+          "BoxOffice": "N/A",
+          "Production": "N/A",
+          "Website": "N/A",
+          "Response": "True"
+        }
+      },
+      {
+        "type": "upcoming",
+        "movieData": {
+          "Title": "Ginny Wedss Sunny 2",
+          "Year": "2026",
+          "Rated": "N/A",
+          "Released": "24 Apr 2026",
+          "Runtime": "N/A",
+          "Genre": "Comedy, Family, Romance",
+          "Director": "Prasshant Jha",
+          "Writer": "N/A",
+          "Actors": "Avinash Tiwary, Yami Gautam, Vikrant Massey",
+          "Plot": "N/A",
+          "Language": "Hindi",
+          "Country": "India",
+          "Awards": "N/A",
+          "Poster": "https://m.media-amazon.com/images/M/MV5BZDk5OTkyYjgtZTQ4ZS00YWMyLWFiMWEtZGUxYWRjNmVjODUzXkEyXkFqcGc@._V1_SX300.jpg",
+          "Ratings": [],
+          "Metascore": "N/A",
+          "imdbRating": "N/A",
+          "imdbVotes": "N/A",
+          "imdbID": "tt36277018",
+          "Type": "movie",
+          "DVD": "N/A",
+          "BoxOffice": "N/A",
+          "Production": "N/A",
+          "Website": "N/A",
+          "Response": "True"
+        }
+      }
+    ]
+  }
+]

@@ -33,6 +33,18 @@ let movieCounter   = 1;
 const userLastSearch = new Map();
 
 // ═══════════════════════════════════════
+// 📅 DAILY QUEUE (Admin approval before posting)  <-- NEW
+// ═══════════════════════════════════════
+let dailyQueue = []; // { date: 'YYYY-MM-DD', items: [ { type: 'new'|'upcoming', movieData: {...} } ] }
+
+async function loadDailyQueue() {
+  dailyQueue = await readJSON('dailyQueue.json', []);
+}
+async function saveDailyQueue() {
+  await writeJSON('dailyQueue.json', dailyQueue);
+}
+
+// ═══════════════════════════════════════
 // 🔍 FUSE.JS INDEX
 // ═══════════════════════════════════════
 let fuseIndex = null;
@@ -60,6 +72,7 @@ async function loadDB() {
   requests  = await readJSON('requests.json', []);
   users     = await readJSON('users.json', {});
   banned    = await readJSON('banned.json', {});
+  await loadDailyQueue();   // <-- NEW
 
   let needsMigration = false;
   const newMovies = {};
@@ -352,7 +365,8 @@ bot.command('help', async ctx => {
     `🆕 */new* — New Bollywood & South Indian releases\n` +
     `🔮 */upcoming* — Upcoming Indian movies\n` +
     `📋 */myrequests* — Track your requests\n\n` +
-    `👑 *Admin only:* /edit, /stats, /broadcast, /delete, /ban, /unban, /pending, /search`;
+    `👑 *Admin only:* /edit, /stats, /broadcast, /delete, /ban, /unban, /pending, /search\n` +
+    `               /queue_add, /queue_view, /queue_clear`; // <-- NEW commands listed
   await tempReply(ctx, helpText, { parse_mode: 'Markdown' });
 });
 
@@ -493,6 +507,52 @@ bot.command('search', async ctx => {
   ctx.reply(txt, { parse_mode: 'Markdown' });
 });
 
+// ─── NEW ADMIN: DAILY QUEUE MANAGEMENT ──────────────────────────
+bot.command('queue_add', async ctx => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  const args = ctx.message.text.split(' ').slice(1);
+  if (args.length < 2) return ctx.reply('Usage: /queue_add new|upcoming <movie name>');
+  const type = args[0].toLowerCase();
+  if (type !== 'new' && type !== 'upcoming') return ctx.reply('Type must be "new" or "upcoming".');
+  const movieName = args.slice(1).join(' ');
+  
+  const omdb = await fetchOMDb(movieName);
+  if (!omdb || !omdb.Poster || omdb.Poster === 'N/A') {
+    return ctx.reply('❌ Movie not found on OMDb.');
+  }
+  
+  const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0,10);
+  let entry = dailyQueue.find(e => e.date === tomorrow);
+  if (!entry) {
+    entry = { date: tomorrow, items: [] };
+    dailyQueue.push(entry);
+  }
+  entry.items.push({ type, movieData: omdb });
+  await saveDailyQueue();
+  ctx.reply(`✅ "${omdb.Title}" added to ${type} queue for ${tomorrow}.`);
+});
+
+bot.command('queue_view', async ctx => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (dailyQueue.length === 0) return ctx.reply('📭 Queue is empty.');
+  
+  let text = '📋 *Daily Post Queue*\n\n';
+  for (const entry of dailyQueue.sort((a,b) => a.date.localeCompare(b.date))) {
+    text += `*${entry.date}*\n`;
+    entry.items.forEach(item => {
+      text += `  ${item.type === 'new' ? '🆕' : '🔮'} ${escapeMarkdown(item.movieData.Title)} (${item.movieData.Year})\n`;
+    });
+  }
+  await ctx.reply(text, { parse_mode: 'Markdown' });
+});
+
+bot.command('queue_clear', async ctx => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  dailyQueue = [];
+  await saveDailyQueue();
+  ctx.reply('✅ Queue cleared.');
+});
+
 // ═══════════════════════════════════════
 // 👋 WELCOME HANDLERS (WITH PINNED HELP)
 // ═══════════════════════════════════════
@@ -538,7 +598,7 @@ bot.on('my_chat_member', async ctx => {
 });
 
 // ═══════════════════════════════════════
-// 📨 MESSAGE HANDLER (SAME AS BEFORE)
+// 📨 MESSAGE HANDLER
 // ═══════════════════════════════════════
 bot.on('message', async (ctx, next) => {
   const msg    = ctx.message;
@@ -734,18 +794,23 @@ async function finishUpload(ctx, state) {
   movieCounter++;
   await saveDB();
   ctx.session.upload = null;
-  return ctx.reply(
-    `✅ *Movie Saved!*\n\n` +
+
+  const caption = `✅ *Movie Saved!*\n\n` +
     `🎬 ${escapeMarkdown(state.name)} (${state.year})\n` +
     `🌐 ${state.language} | 📺 ${state.quality}` +
     `${state.size ? ' | '+fmtSize(state.size) : ''}\n` +
-    `🆔 ID: \`${key}\``,
-    { parse_mode: 'Markdown' }
-  );
+    `🆔 ID: \`${key}\``;
+
+  // NEW: Add button to optionally post to channel
+  const kb = new InlineKeyboard()
+    .text('📢 Post to Channel', `post_to_channel_${key}`)
+    .text('❌ No', 'dismiss_post');
+
+  return ctx.reply(caption, { parse_mode: 'Markdown', reply_markup: kb });
 }
 
 // ═══════════════════════════════════════
-// 🔘 CALLBACK HANDLER (SAME)
+// 🔘 CALLBACK HANDLER
 // ═══════════════════════════════════════
 bot.on('callback_query:data', async ctx => {
   const data   = ctx.callbackQuery.data;
@@ -875,11 +940,35 @@ bot.on('callback_query:data', async ctx => {
     return ctx.answerCallbackQuery({ text: '✅ Marked fulfilled' });
   }
 
+  // ─── NEW CALLBACK: POST NEW MOVIE TO CHANNEL ─────────────────────
+  if (data.startsWith('post_to_channel_')) {
+    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    const movieId = data.slice('post_to_channel_'.length);
+    const m = movies[movieId];
+    if (!m) return ctx.answerCallbackQuery({ text: '❌ Movie not found' });
+
+    try {
+      await ctx.api.sendVideo(CHANNEL, m.file_id, {
+        caption: `🎬 *New Movie Added!*\n\n${escapeMarkdown(m.name)} (${m.year||'?'})\n🌐 ${m.language||'N/A'} | 📺 ${m.quality||'N/A'}${m.size?' | '+fmtSize(m.size):''}\n\n📥 Use the bot to download!`,
+        parse_mode: 'Markdown'
+      });
+      await ctx.editMessageReplyMarkup({ reply_markup: new InlineKeyboard().text('✅ Posted', 'done') });
+      return ctx.answerCallbackQuery({ text: '✅ Posted to channel!' });
+    } catch (e) {
+      return ctx.answerCallbackQuery({ text: '❌ Failed to post.', show_alert: true });
+    }
+  }
+
+  if (data === 'dismiss_post') {
+    await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+    return ctx.answerCallbackQuery();
+  }
+
   return ctx.answerCallbackQuery();
 });
 
 // ═══════════════════════════════════════
-// 📅 DAILY AUTO POST (FIXED & FULL)
+// 📅 DAILY AUTO POST (MODIFIED: Uses queue if present, else auto-fetch)
 // ═══════════════════════════════════════
 const DAILY_FILE = 'lastDailySent.json';
 async function sendDailySuggestions() {
@@ -895,31 +984,46 @@ async function sendDailySuggestions() {
 
     console.log('[DAILY] Sending daily post...');
 
-    // 1. Send 3 new Indian releases
-    try {
-      const newMovies = await getIndianMoviesByType('new', 3);
-      for (const m of newMovies) {
-        await bot.api.sendPhoto(CHANNEL, m.Poster, {
-          caption: `🆕 *New Indian Release!*\n\n🎬 ${escapeMarkdown(m.Title)} (${m.Year})\n⭐ IMDb: ${m.imdbRating || 'N/A'}\n📖 ${escapeMarkdown(m.Plot || '')}\n\n📥 Search on bot to request!`,
-          parse_mode: 'Markdown'
-        });
-        await new Promise(r => setTimeout(r, 1000));
-      }
-    } catch (e) { console.error('[DAILY] New movies error:', e); }
+    // Check if admin has queued items for today
+    const todayQueue = dailyQueue.find(entry => entry.date === today);
+    let newMoviesList = [];
+    let upcomingMoviesList = [];
 
-    // 2. Send 2 upcoming Indian movies
-    try {
-      const upcomingMovies = await getIndianMoviesByType('upcoming', 2);
-      for (const m of upcomingMovies) {
-        await bot.api.sendPhoto(CHANNEL, m.Poster, {
-          caption: `🔮 *Upcoming Indian Movie!*\n\n🎬 ${escapeMarkdown(m.Title)} (${m.Year})\n⭐ IMDb: ${m.imdbRating || 'N/A'}\n📖 ${escapeMarkdown(m.Plot || '')}\n\n📥 Search on bot to request!`,
-          parse_mode: 'Markdown'
-        });
-        await new Promise(r => setTimeout(r, 1000));
-      }
-    } catch (e) { console.error('[DAILY] Upcoming movies error:', e); }
+    if (todayQueue && todayQueue.items.length > 0) {
+      // Use admin-curated queue
+      console.log('[DAILY] Using admin queue for today.');
+      newMoviesList = todayQueue.items.filter(i => i.type === 'new').map(i => i.movieData);
+      upcomingMoviesList = todayQueue.items.filter(i => i.type === 'upcoming').map(i => i.movieData);
+    } else {
+      // Fallback to original automatic fetch
+      console.log('[DAILY] No queue found, fetching automatically...');
+      try {
+        newMoviesList = await getIndianMoviesByType('new', 3);
+      } catch (e) { console.error('[DAILY] New movies fetch error:', e); }
+      try {
+        upcomingMoviesList = await getIndianMoviesByType('upcoming', 2);
+      } catch (e) { console.error('[DAILY] Upcoming fetch error:', e); }
+    }
 
-    // 3. Send 5 random movies from local DB (no repeat - shuffled)
+    // Send new releases (queue or automatic)
+    for (const m of newMoviesList) {
+      await bot.api.sendPhoto(CHANNEL, m.Poster, {
+        caption: `🆕 *New Indian Release!*\n\n🎬 ${escapeMarkdown(m.Title)} (${m.Year})\n⭐ IMDb: ${m.imdbRating || 'N/A'}\n📖 ${escapeMarkdown(m.Plot || '')}\n\n📥 Search on bot to request!`,
+        parse_mode: 'Markdown'
+      });
+      await new Promise(r => setTimeout(r, 1000));
+    }
+
+    // Send upcoming releases (queue or automatic)
+    for (const m of upcomingMoviesList) {
+      await bot.api.sendPhoto(CHANNEL, m.Poster, {
+        caption: `🔮 *Upcoming Indian Movie!*\n\n🎬 ${escapeMarkdown(m.Title)} (${m.Year})\n⭐ IMDb: ${m.imdbRating || 'N/A'}\n📖 ${escapeMarkdown(m.Plot || '')}\n\n📥 Search on bot to request!`,
+        parse_mode: 'Markdown'
+      });
+      await new Promise(r => setTimeout(r, 1000));
+    }
+
+    // 3. Send 5 random movies from local DB (unchanged)
     const list = Object.values(movies);
     if (list.length) {
       const shuffled = [...list].sort(() => Math.random() - 0.5);

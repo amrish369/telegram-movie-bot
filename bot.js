@@ -12,7 +12,7 @@ const BOT_TOKEN   = process.env.BOT_TOKEN;
 const OMDB_API_KEY = process.env.OMDB_API_KEY;
 const ADMIN_ID    = Number(process.env.ADMIN_ID) || 5951923988;
 const CHANNEL     = process.env.CHANNEL || '@cineradarai';
-const AUTO_DELETE  = 5 * 60 * 1000;   // 5 minutes
+const AUTO_DELETE  = 3 * 60 * 1000;   // 3 minutes
 const WELCOME_GIF = 'https://media.tenor.com/8d9B7xYkZk0AAAAC/welcome.gif';
 const OMDB_BASE   = 'https://www.omdbapi.com/';
 
@@ -33,9 +33,9 @@ let movieCounter   = 1;
 const userLastSearch = new Map();
 
 // ═══════════════════════════════════════
-// 📅 DAILY QUEUE (Admin approval before posting)  <-- NEW
+// 📅 DAILY QUEUE (Admin approval before posting)
 // ═══════════════════════════════════════
-let dailyQueue = []; // { date: 'YYYY-MM-DD', items: [ { type: 'new'|'upcoming', movieData: {...} } ] }
+let dailyQueue = [];
 
 async function loadDailyQueue() {
   dailyQueue = await readJSON('dailyQueue.json', []);
@@ -72,7 +72,7 @@ async function loadDB() {
   requests  = await readJSON('requests.json', []);
   users     = await readJSON('users.json', {});
   banned    = await readJSON('banned.json', {});
-  await loadDailyQueue();   // <-- NEW
+  await loadDailyQueue();
 
   let needsMigration = false;
   const newMovies = {};
@@ -140,7 +140,12 @@ function scheduleDelete(api, chatId, ...msgIds) {
   }, AUTO_DELETE);
 }
 
+// Modified tempReply - admin messages are never deleted
 async function tempReply(ctx, text, options = {}) {
+  if (ctx.from?.id === ADMIN_ID) {
+    return ctx.reply(text, options);
+  }
+
   try {
     const msg = await ctx.reply(text, options);
     const chatId = ctx.chat.id;
@@ -153,7 +158,12 @@ async function tempReply(ctx, text, options = {}) {
   }
 }
 
+// Modified tempPhoto - admin messages are never deleted
 async function tempPhoto(ctx, photo, options = {}) {
+  if (ctx.from?.id === ADMIN_ID) {
+    return ctx.replyWithPhoto(photo, options);
+  }
+
   try {
     const msg = await ctx.replyWithPhoto(photo, options);
     const chatId = ctx.chat.id;
@@ -166,7 +176,12 @@ async function tempPhoto(ctx, photo, options = {}) {
   }
 }
 
+// Modified tempAnim - admin messages are never deleted
 async function tempAnim(ctx, anim, options = {}) {
+  if (ctx.from?.id === ADMIN_ID) {
+    return ctx.replyWithAnimation(anim, options);
+  }
+
   try {
     const msg = await ctx.replyWithAnimation(anim, options);
     scheduleDelete(ctx.api, ctx.chat.id, msg.message_id);
@@ -249,28 +264,28 @@ const INDIAN_KEYWORDS = [
 async function getIndianMoviesByType(type = 'new', count = 5) {
   const year = type === 'new' ? new Date().getFullYear() : new Date().getFullYear() + 1;
   const allMovies = [];
-  
+
   for (const kw of INDIAN_KEYWORDS.slice(0, 8)) {
     const res = await searchOMDb(kw, String(year));
     allMovies.push(...res);
     if (allMovies.length >= count * 3) break;
     await new Promise(r => setTimeout(r, 200));
   }
-  
+
   const unique = [...new Map(allMovies.map(m => [m.imdbID, m])).values()];
   const indianMovies = [];
-  
+
   for (const m of unique) {
     const details = await fetchOMDb(m.Title);
     if (!details || !details.Poster || details.Poster === 'N/A') continue;
-    
+
     const lang = (details.Language || '').toLowerCase();
     const country = (details.Country || '').toLowerCase();
     const isIndian = 
       lang.includes('hindi') || lang.includes('tamil') || lang.includes('telugu') ||
       lang.includes('malayalam') || lang.includes('kannada') ||
       country.includes('india');
-    
+
     if (isIndian) {
       indianMovies.push(details);
       if (indianMovies.length >= count) break;
@@ -335,10 +350,62 @@ function buildFilterKeyboard(query, results) {
 }
 
 // ═══════════════════════════════════════
+// 🔍 SMART QUERY PARSER (extract name, year, language)
+// ═══════════════════════════════════════
+const KNOWN_LANGUAGES = [
+  'hindi', 'english', 'tamil', 'telugu', 'malayalam', 'kannada',
+  'dual audio', 'multi audio', 'punjabi', 'bengali', 'marathi'
+];
+
+function parseQuery(rawQuery) {
+  const query = rawQuery.toLowerCase().trim();
+  
+  const yearMatch = query.match(/\b(19\d{2}|20\d{2})\b/);
+  const year = yearMatch ? yearMatch[0] : null;
+  
+  let namePart = query.replace(/\b(19\d{2}|20\d{2})\b/, '').trim();
+  
+  let language = null;
+  const sortedLangs = [...KNOWN_LANGUAGES].sort((a, b) => b.length - a.length);
+  for (const lang of sortedLangs) {
+    const regex = new RegExp(`\\b${lang}\\b`, 'i');
+    if (regex.test(namePart)) {
+      language = lang.charAt(0).toUpperCase() + lang.slice(1);
+      namePart = namePart.replace(regex, '').trim();
+      break;
+    }
+  }
+  
+  let movieName = namePart.replace(/\s+/g, ' ').trim();
+  
+  if (!movieName) movieName = query;
+  
+  return { movieName, year, language };
+}
+
+// ═══════════════════════════════════════
 // 🤖 BOT INIT
 // ═══════════════════════════════════════
 const bot = new Bot(BOT_TOKEN);
 bot.use(session({ initial: () => ({}) }));
+
+// ═══════════════════════════════════════
+// 🧹 Global auto-delete for non-admin user messages (3 minutes)
+// ═══════════════════════════════════════
+bot.use(async (ctx, next) => {
+  await next();
+
+  const msg = ctx.message;
+  if (!msg) return;
+
+  const userId = ctx.from?.id;
+  if (userId === ADMIN_ID) return;
+
+  setTimeout(() => {
+    ctx.api.deleteMessage(ctx.chat.id, msg.message_id).catch(() => {});
+  }, AUTO_DELETE);
+});
+
 bot.use(rateLimit);
 bot.use(banCheck);
 
@@ -351,7 +418,7 @@ bot.command('start', async ctx => {
   trackUser(ctx.from.id, ctx.from.first_name, ctx.from.username);
   const safeFirstName = escapeMarkdown(ctx.from.first_name);
   await tempAnim(ctx, WELCOME_GIF, {
-    caption: `🎬 *Welcome to CineRadar AI, ${safeFirstName}!*\n\n🔍 Type movie name (min 3 chars) to search.\n⏱️ Messages auto-delete in 5 minutes.`,
+    caption: `🎬 *Welcome to CineRadar AI, ${safeFirstName}!*\n\n🔍 Type movie name (min 3 chars) to search.\n⏱️ Messages auto-delete in 3 minutes Movie ko kahi aur forward karke save kar le .`,
     parse_mode: 'Markdown'
   });
 });
@@ -366,7 +433,7 @@ bot.command('help', async ctx => {
     `🔮 */upcoming* — Upcoming Indian movies\n` +
     `📋 */myrequests* — Track your requests\n\n` +
     `👑 *Admin only:* /edit, /stats, /broadcast, /delete, /ban, /unban, /pending, /search\n` +
-    `               /queue_add, /queue_view, /queue_clear`; // <-- NEW commands listed
+    `               /queue_add, /queue_view, /queue_clear`;
   await tempReply(ctx, helpText, { parse_mode: 'Markdown' });
 });
 
@@ -507,7 +574,7 @@ bot.command('search', async ctx => {
   ctx.reply(txt, { parse_mode: 'Markdown' });
 });
 
-// ─── NEW ADMIN: DAILY QUEUE MANAGEMENT ──────────────────────────
+// ─── ADMIN: DAILY QUEUE MANAGEMENT ──────────────────────────
 bot.command('queue_add', async ctx => {
   if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
   const args = ctx.message.text.split(' ').slice(1);
@@ -515,12 +582,12 @@ bot.command('queue_add', async ctx => {
   const type = args[0].toLowerCase();
   if (type !== 'new' && type !== 'upcoming') return ctx.reply('Type must be "new" or "upcoming".');
   const movieName = args.slice(1).join(' ');
-  
+
   const omdb = await fetchOMDb(movieName);
   if (!omdb || !omdb.Poster || omdb.Poster === 'N/A') {
     return ctx.reply('❌ Movie not found on OMDb.');
   }
-  
+
   const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0,10);
   let entry = dailyQueue.find(e => e.date === tomorrow);
   if (!entry) {
@@ -535,7 +602,7 @@ bot.command('queue_add', async ctx => {
 bot.command('queue_view', async ctx => {
   if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
   if (dailyQueue.length === 0) return ctx.reply('📭 Queue is empty.');
-  
+
   let text = '📋 *Daily Post Queue*\n\n';
   for (const entry of dailyQueue.sort((a,b) => a.date.localeCompare(b.date))) {
     text += `*${entry.date}*\n`;
@@ -564,7 +631,8 @@ bot.on('message:new_chat_members', async ctx => {
     const firstName = escapeMarkdown(member.first_name);
     const welcomeMsg = `👋 Welcome ${firstName}!\n\n🎬 *CineRadar AI* me aapka swagat hai.\n📌 Movie paane ke liye bas movie ka naam type karein (minimum 3 letters).\n🔍 Example: *Krish*\n\n🔥 Enjoy HD Movies!`;
     try {
-      await ctx.api.sendMessage(chatId, welcomeMsg, { parse_mode: 'Markdown' });
+      // Use tempReply to auto-delete welcome after 3 min
+      await tempReply(ctx, welcomeMsg, { parse_mode: 'Markdown' });
     } catch (e) {
       console.error('Group welcome error:', e.message);
     }
@@ -575,7 +643,7 @@ bot.on('my_chat_member', async ctx => {
   const chatId = ctx.chat.id;
   const newStatus = ctx.update.my_chat_member.new_chat_member.status;
   const oldStatus = ctx.update.my_chat_member.old_chat_member.status;
-  
+
   if (newStatus === 'member' && oldStatus !== 'member') {
     const helpText = 
       `🤖 *CineRadar AI is now active in this group!*\n\n` +
@@ -587,10 +655,11 @@ bot.on('my_chat_member', async ctx => {
       `• /help — Show this message\n\n` +
       `📌 *This message is pinned for easy access.*\n` +
       `🔞 No 18+ content allowed.\n👑 Admin: @cineradarai_admin`;
-    
+
     try {
       const sent = await ctx.api.sendMessage(chatId, helpText, { parse_mode: 'Markdown' });
       await ctx.api.pinChatMessage(chatId, sent.message_id);
+      // Do NOT delete the pinned help message
     } catch (e) {
       console.error('Bot added welcome/pin error:', e.message);
     }
@@ -675,7 +744,10 @@ bot.on('message', async (ctx, next) => {
   if (!msg.text || msg.text.startsWith('/')) return next();
   if (msg.text.length < 3) return tempReply(ctx, '⚠️ Please enter at least 3 characters.');
 
-  const query = sanitize(msg.text.toLowerCase());
+  const rawQuery = sanitize(msg.text);
+  const { movieName: parsedName, year: parsedYear, language: parsedLang } = parseQuery(rawQuery);
+  
+  const query = parsedName.toLowerCase();
   userLastSearch.set(userId, query);
 
   if (users[userId]) { users[userId].search_count = (users[userId].search_count||0)+1; saveUsers(); }
@@ -685,7 +757,7 @@ bot.on('message', async (ctx, next) => {
     return tempReply(ctx, '🚫 Please join our channel first!', { reply_markup: kb });
   }
 
-  const omdb = await fetchOMDb(query);
+  const omdb = await fetchOMDb(parsedName);
 
   if (omdb && omdb.Poster && omdb.Poster !== 'N/A') {
     let caption = `🎬 *${escapeMarkdown(omdb.Title)}* (${omdb.Year})\n`;
@@ -694,7 +766,13 @@ bot.on('message', async (ctx, next) => {
     if (omdb.Director !== 'N/A') caption += `🎥 ${escapeMarkdown(omdb.Director)}\n`;
     if (omdb.Plot     !== 'N/A') caption += `\n📖 ${escapeMarkdown(omdb.Plot)}\n`;
 
-    const matches = searchMovies(omdb.Title);
+    let matches = searchMovies(parsedName);
+    if (parsedYear) {
+      matches = matches.filter(m => String(m.year) === parsedYear);
+    }
+    if (parsedLang) {
+      matches = matches.filter(m => (m.language || '').toLowerCase() === parsedLang.toLowerCase());
+    }
 
     if (matches.length > 0) {
       caption += `\n✅ *Available — ${matches.length} version(s)*`;
@@ -706,7 +784,7 @@ bot.on('message', async (ctx, next) => {
         }
       });
       if (matches.length > 1) {
-        const fkb = buildFilterKeyboard(query, matches);
+        const fkb = buildFilterKeyboard(parsedName, matches);
         return tempPhoto(ctx, omdb.Poster, { caption, parse_mode: 'Markdown', reply_markup: mergeKeyboards(kb, fkb) });
       }
       return tempPhoto(ctx, omdb.Poster, { caption, parse_mode: 'Markdown', reply_markup: kb });
@@ -719,8 +797,14 @@ bot.on('message', async (ctx, next) => {
     }
   }
 
-  // Local search
-  const results = searchMovies(query);
+  let results = searchMovies(parsedName);
+  if (parsedYear) {
+    results = results.filter(m => String(m.year) === parsedYear);
+  }
+  if (parsedLang) {
+    results = results.filter(m => (m.language || '').toLowerCase() === parsedLang.toLowerCase());
+  }
+
   if (results.length > 0) {
     let txt = `🎬 *Found ${results.length} result(s) for "${escapeMarkdown(sanitize(msg.text))}"*\n\n`;
     const grouped = groupMovies(results);
@@ -736,15 +820,18 @@ bot.on('message', async (ctx, next) => {
     });
 
     if (results.length > 1) {
-      const fkb = buildFilterKeyboard(query, results);
+      const fkb = buildFilterKeyboard(parsedName, results);
       return tempReply(ctx, txt, { parse_mode: 'Markdown', reply_markup: mergeKeyboards(kb, fkb) });
     }
     return tempReply(ctx, txt, { parse_mode: 'Markdown', reply_markup: kb });
   }
 
-  const suggestion = fuzzyMatch(query);
+  const suggestion = fuzzyMatch(parsedName);
   if (suggestion) {
-    const sugResults = searchMovies(suggestion);
+    let sugResults = searchMovies(suggestion);
+    if (parsedYear) sugResults = sugResults.filter(m => String(m.year) === parsedYear);
+    if (parsedLang) sugResults = sugResults.filter(m => (m.language || '').toLowerCase() === parsedLang.toLowerCase());
+    
     if (sugResults.length) {
       const kb = new InlineKeyboard();
       sugResults.forEach(m => kb.text(movieBtnLabel(m), `send_${m.id}`).row());
@@ -753,7 +840,7 @@ bot.on('message', async (ctx, next) => {
     }
   }
 
-  const omdbFallback = await fetchOMDb(query);
+  const omdbFallback = await fetchOMDb(parsedName);
   if (omdbFallback && omdbFallback.Poster && omdbFallback.Poster !== 'N/A') {
     let caption = `🎬 *${escapeMarkdown(omdbFallback.Title)}* (${omdbFallback.Year})\n`;
     if (omdbFallback.Plot !== 'N/A') caption += `\n📖 ${escapeMarkdown(omdbFallback.Plot)}\n`;
@@ -765,7 +852,7 @@ bot.on('message', async (ctx, next) => {
   }
 
   const kb = new InlineKeyboard()
-    .text('📩 Request Movie', `request_${encodeURIComponent(query)}`)
+    .text('📩 Request Movie', `request_${encodeURIComponent(parsedName)}`)
     .url('📢 Channel', `https://t.me/${CHANNEL.replace('@','')}`);
   return tempReply(ctx, `❌ *"${escapeMarkdown(sanitize(msg.text))}"* not found.\n\nRequest it below!`, { parse_mode: 'Markdown', reply_markup: kb });
 });
@@ -801,12 +888,11 @@ async function finishUpload(ctx, state) {
     `${state.size ? ' | '+fmtSize(state.size) : ''}\n` +
     `🆔 ID: \`${key}\``;
 
-  // NEW: Add button to optionally post to channel
   const kb = new InlineKeyboard()
     .text('📢 Post to Channel', `post_to_channel_${key}`)
     .text('❌ No', 'dismiss_post');
 
-  return ctx.reply(caption, { parse_mode: 'Markdown', reply_markup: kb });
+  return tempReply(ctx, caption, { parse_mode: 'Markdown', reply_markup: kb });
 }
 
 // ═══════════════════════════════════════
@@ -848,13 +934,15 @@ bot.on('callback_query:data', async ctx => {
     if (users[userId]) users[userId].downloads = (users[userId].downloads||0) + 1;
     saveDB(); saveUsers();
 
-    const caption = `🎬 *${escapeMarkdown(m.name)}* (${m.year||'?'})\n🌐 ${m.language||'N/A'} | 📺 ${m.quality||'N/A'}${m.size?' | '+fmtSize(m.size):''}\n\n⏱️ *Auto-deletes in 5 minutes.*`;
+    const caption = `🎬 *${escapeMarkdown(m.name)}* (${m.year||'?'})\n🌐 ${m.language||'N/A'} | 📺 ${m.quality||'N/A'}${m.size?' | '+fmtSize(m.size):''}\n\n⏱️ *Auto-deletes in 3 minutes forward and save .*`;
     try {
       const sent = await ctx.replyWithVideo(m.file_id, {
         caption, parse_mode: 'Markdown',
         reply_markup: new InlineKeyboard().url('💬 Join Channel', `https://t.me/${CHANNEL.replace('@','')}`)
       });
-      scheduleDelete(ctx.api, ctx.chat.id, sent.message_id);
+      if (userId !== ADMIN_ID) {
+        scheduleDelete(ctx.api, ctx.chat.id, sent.message_id);
+      }
       return ctx.answerCallbackQuery({ text: `📥 ${m.name}` });
     } catch (e) {
       return ctx.answerCallbackQuery({ text: '❌ Error sending file.', show_alert: true });
@@ -895,7 +983,8 @@ bot.on('callback_query:data', async ctx => {
     if (already) return ctx.answerCallbackQuery({ text: '⚠️ Already requested!', show_alert: true });
     requests.push({ user: userId, movie: movieName, time: new Date().toISOString(), status: 'Pending' });
     await saveRequests();
-    await ctx.reply(`✅ *Request sent for "${escapeMarkdown(movieName)}"!*\n\nUse /myrequests to track.`, { parse_mode: 'Markdown' });
+    // Use tempReply to auto-delete after 3 min
+    await tempReply(ctx, `✅ *Request sent for "${escapeMarkdown(movieName)}"!*\n\nUse /myrequests to track.`, { parse_mode: 'Markdown' });
     try {
       await ctx.api.sendMessage(ADMIN_ID, `📩 *New Request*\n\n🎬 ${escapeMarkdown(movieName)}\n👤 User: ${userId}`, { parse_mode: 'Markdown' });
     } catch {}
@@ -940,7 +1029,6 @@ bot.on('callback_query:data', async ctx => {
     return ctx.answerCallbackQuery({ text: '✅ Marked fulfilled' });
   }
 
-  // ─── NEW CALLBACK: POST NEW MOVIE TO CHANNEL ─────────────────────
   if (data.startsWith('post_to_channel_')) {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const movieId = data.slice('post_to_channel_'.length);
@@ -976,7 +1064,7 @@ async function sendDailySuggestions() {
     let lastDate = '';
     try { lastDate = (await fs.readFile(DAILY_FILE, 'utf8')).trim(); } catch {}
     const today = new Date().toISOString().slice(0,10);
-    
+
     if (lastDate === today) {
       console.log('[DAILY] Already sent today.');
       return;
@@ -984,18 +1072,15 @@ async function sendDailySuggestions() {
 
     console.log('[DAILY] Sending daily post...');
 
-    // Check if admin has queued items for today
     const todayQueue = dailyQueue.find(entry => entry.date === today);
     let newMoviesList = [];
     let upcomingMoviesList = [];
 
     if (todayQueue && todayQueue.items.length > 0) {
-      // Use admin-curated queue
       console.log('[DAILY] Using admin queue for today.');
       newMoviesList = todayQueue.items.filter(i => i.type === 'new').map(i => i.movieData);
       upcomingMoviesList = todayQueue.items.filter(i => i.type === 'upcoming').map(i => i.movieData);
     } else {
-      // Fallback to original automatic fetch
       console.log('[DAILY] No queue found, fetching automatically...');
       try {
         newMoviesList = await getIndianMoviesByType('new', 3);
@@ -1005,7 +1090,6 @@ async function sendDailySuggestions() {
       } catch (e) { console.error('[DAILY] Upcoming fetch error:', e); }
     }
 
-    // Send new releases (queue or automatic)
     for (const m of newMoviesList) {
       await bot.api.sendPhoto(CHANNEL, m.Poster, {
         caption: `🆕 *New Indian Release!*\n\n🎬 ${escapeMarkdown(m.Title)} (${m.Year})\n⭐ IMDb: ${m.imdbRating || 'N/A'}\n📖 ${escapeMarkdown(m.Plot || '')}\n\n📥 Search on bot to request!`,
@@ -1014,7 +1098,6 @@ async function sendDailySuggestions() {
       await new Promise(r => setTimeout(r, 1000));
     }
 
-    // Send upcoming releases (queue or automatic)
     for (const m of upcomingMoviesList) {
       await bot.api.sendPhoto(CHANNEL, m.Poster, {
         caption: `🔮 *Upcoming Indian Movie!*\n\n🎬 ${escapeMarkdown(m.Title)} (${m.Year})\n⭐ IMDb: ${m.imdbRating || 'N/A'}\n📖 ${escapeMarkdown(m.Plot || '')}\n\n📥 Search on bot to request!`,
@@ -1023,7 +1106,6 @@ async function sendDailySuggestions() {
       await new Promise(r => setTimeout(r, 1000));
     }
 
-    // 3. Send 5 random movies from local DB (unchanged)
     const list = Object.values(movies);
     if (list.length) {
       const shuffled = [...list].sort(() => Math.random() - 0.5);
@@ -1031,7 +1113,7 @@ async function sendDailySuggestions() {
       for (const m of selected) {
         try {
           await bot.api.sendVideo(CHANNEL, m.file_id, {
-            caption: `🎬 *आज की सुझाई गई मूवी*\n\n${escapeMarkdown(m.name)} (${m.year||'?'})\n🌐 ${m.language||'N/A'} | 📺 ${m.quality||'N/A'}${m.size?' | '+fmtSize(m.size):''}\n\n📥 Bot पर जाकर डाउनलोड करें!`,
+            caption: `🎬 *Today's Suggestion*\n\n${escapeMarkdown(m.name)} (${m.year||'?'})\n🌐 ${m.language||'N/A'} | 📺 ${m.quality||'N/A'}${m.size?' | '+fmtSize(m.size):''}\n\n📥 Download using the bot!`,
             parse_mode: 'Markdown'
           });
           await new Promise(r => setTimeout(r, 2000));
@@ -1044,12 +1126,10 @@ async function sendDailySuggestions() {
   } catch (e) { console.error('[DAILY] Fatal error:', e); }
 }
 
-// Check every hour
 setInterval(() => {
   sendDailySuggestions().catch(e => console.error('[DAILY] Interval error:', e));
 }, 60 * 60 * 1000);
 
-// Run once at startup (after 5 sec)
 setTimeout(() => {
   sendDailySuggestions().catch(e => console.error('[DAILY] Startup error:', e));
 }, 5000);

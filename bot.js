@@ -525,7 +525,7 @@ bot.command('new', async ctx => {
         `💡 *Visit our website for 3x download speed!*`;
       const kb = new InlineKeyboard()
         .text('📩 Request', `request_${encodeURIComponent(m.Title)}`)
-        .url('🌐 Visit Website (3x Speed)', WEBSITE_URL)
+        .url('🌐 Visit Website (3x download Speed)', WEBSITE_URL)
         .row()
         .url('📷 Instagram', INSTAGRAM_URL);
       await tempPhoto(ctx, m.Poster, { caption, parse_mode: 'Markdown', reply_markup: kb });
@@ -872,7 +872,7 @@ bot.on('message', async (ctx, next) => {
           kb.text(`✏️ Edit "${m.name.slice(0, 20)}"`, `edit_${m.id}`).row();
         }
       });
-      kb.url('🌐 Visit Website (3x Speed)', WEBSITE_URL).row();
+      kb.url('🌐 Visit Website (3x dowload Speed)', WEBSITE_URL).row();
       kb.url('📷 Follow on Instagram', INSTAGRAM_URL);
 
       if (matches.length > 1) {
@@ -908,7 +908,7 @@ bot.on('message', async (ctx, next) => {
         kb.text(`✏️ Edit`, `edit_${m.id}`).row();
       }
     });
-    kb.url('🌐 Visit Website (3x Speed)', WEBSITE_URL).row();
+    kb.url('🌐 Visit Website (3x download Speed)', WEBSITE_URL).row();
     kb.url('📷 Follow on Instagram', INSTAGRAM_URL);
 
     if (results.length > 1) {
@@ -927,7 +927,7 @@ bot.on('message', async (ctx, next) => {
     if (sugResults.length) {
       const kb = new InlineKeyboard();
       sugResults.forEach(m => kb.text(movieBtnLabel(m), `send_${m.id}`).row());
-      kb.url('🌐 Visit Website (3x Speed)', WEBSITE_URL).row();
+      kb.url('🌐 Visit Website (3x download Speed)', WEBSITE_URL).row();
       kb.url('📷 Instagram', INSTAGRAM_URL);
       return tempReply(ctx,
         `❓ *"${escapeMarkdown(sanitize(msg.text))}"* not found.\n\nDid you mean *${escapeMarkdown(suggestion)}*?\n\n💡 *Visit website for 3x speed!*`,
@@ -995,7 +995,7 @@ bot.on('callback_query:data', async ctx => {
       `⏱️ *Auto-deletes in 3 minutes - forward and save.*`;
 
     const kb = new InlineKeyboard()
-      .url('🌐 Visit Website (3x Speed)', WEBSITE_URL)
+      .url('🌐 Visit Website (3x download Speed)', WEBSITE_URL)
       .row()
       .url('📷 Follow on Instagram', INSTAGRAM_URL);
 
@@ -1082,7 +1082,7 @@ bot.on('callback_query:data', async ctx => {
       `⏱️ *Auto-deletes in 3 minutes - forward and save.*`;
 
     const kb = new InlineKeyboard()
-      .url('🌐 Visit Website (3x Speed)', WEBSITE_URL)
+      .url('🌐 Visit Website (3x download Speed)', WEBSITE_URL)
       .row()
       .url('📷 Follow on Instagram', INSTAGRAM_URL);
 
@@ -1120,7 +1120,7 @@ bot.on('callback_query:data', async ctx => {
         kb.text(`✏️ Edit`, `edit_${m.id}`).row();
       }
     });
-    kb.url('🌐 Visit Website (3x Speed)', WEBSITE_URL).row();
+    kb.url('🌐 Visit Website (3x download Speed)', WEBSITE_URL).row();
     kb.url('📷 Instagram', INSTAGRAM_URL);
 
     const fkb = buildFilterKeyboard(fullQuery, results);
@@ -1215,7 +1215,7 @@ bot.on('callback_query:data', async ctx => {
           `${escapeMarkdown(m.name)} (${m.year || '?'})\n` +
           `🌐 ${m.language || 'N/A'} | 📺 ${m.quality || 'N/A'}${m.size ? ' | ' + fmtSize(m.size) : ''}\n\n` +
           `📥 Use the bot to download!\n` +
-          `💡 *Visit ${WEBSITE_URL} for 3x speed!*`,
+          `💡 *Visit ${WEBSITE_URL} for 3x download speed!*`,
         parse_mode: 'Markdown'
       });
       // FIX #8: use a valid empty keyboard instead of undefined
@@ -1276,7 +1276,7 @@ async function sendDailySuggestions() {
           `⭐ IMDb: ${m.imdbRating || 'N/A'}\n` +
           `📖 ${escapeMarkdown(m.Plot || '')}\n\n` +
           `📥 Search on bot to request!\n` +
-          `💡 *Visit ${WEBSITE_URL} for 3x speed!*`,
+          `💡 *Visit ${WEBSITE_URL} for 3x download speed!*`,
         parse_mode: 'Markdown'
       }).catch(e => console.error('[DAILY] sendPhoto new error:', e.message));
       await new Promise(r => setTimeout(r, 1000));

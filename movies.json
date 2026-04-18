@@ -130,7 +130,7 @@
     "language": "Hindi",
     "quality": "1080p",
     "size": null,
-    "downloads": 1
+    "downloads": 3
   },
   "m_14": {
     "id": "m_14",
@@ -624,7 +624,8 @@
     "year": "2025",
     "language": "Hindi",
     "quality": "1080p",
-    "size": null
+    "size": null,
+    "downloads": 1
   },
   "m_64": {
     "id": "m_64",
@@ -634,7 +635,8 @@
     "year": "2025",
     "language": "Hindi",
     "quality": "720p",
-    "size": null
+    "size": null,
+    "downloads": 1
   },
   "m_65": {
     "id": "m_65",
@@ -644,7 +646,8 @@
     "year": "2025",
     "language": "Hindi",
     "quality": "480p",
-    "size": null
+    "size": null,
+    "downloads": 1
   },
   "m_66": {
     "id": "m_66",

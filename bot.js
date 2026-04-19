@@ -10,1225 +10,990 @@ const { exec } = require('child_process');
 // ═══════════════════════════════════════
 const BOT_TOKEN    = process.env.BOT_TOKEN;
 const OMDB_API_KEY = process.env.OMDB_API_KEY;
-const ADMIN_ID     = Number(process.env.ADMIN_ID) || 5951923988;
-const CHANNEL      = process.env.CHANNEL || '@cineradarai';
+const ADMIN_ID     = Number(process.env.ADMIN_ID);
+const CHANNEL      = process.env.CHANNEL      || '@cineradarai';
+const BACKUP_GROUP = process.env.BACKUP_GROUP || '-1005223253102';
+const WEBSITE_URL  = process.env.WEBSITE_URL  || 'https://www.compressdocument.in/';
+const INSTAGRAM_URL = process.env.INSTAGRAM_URL || 'https://www.instagram.com/cineradarai';
 const AUTO_DELETE  = 3 * 60 * 1000;
-const WELCOME_GIF  = 'https://media.tenor.com/8d9B7xYkZk0AAAAC/welcome.gif';
 const OMDB_BASE    = 'https://www.omdbapi.com/';
-const WEBSITE_URL  = 'https://www.compressdocument.in/';
-const INSTAGRAM_URL = 'https://www.instagram.com/_www.compressdocument.in?igsh=MzNtdGVoeHp3YWhq';
+const WELCOME_GIF  = 'https://media.tenor.com/8d9B7xYkZk0AAAAC/welcome.gif';
 
-if (!BOT_TOKEN)    throw new Error('❌ BOT_TOKEN missing in .env');
-if (!OMDB_API_KEY) throw new Error('❌ OMDB_API_KEY missing in .env');
+if (!BOT_TOKEN)    { console.error('BOT_TOKEN missing'); process.exit(1); }
+if (!OMDB_API_KEY) { console.error('OMDB_API_KEY missing'); process.exit(1); }
+if (!ADMIN_ID)     { console.error('ADMIN_ID missing'); process.exit(1); }
+
+console.log('Config OK | Admin:', ADMIN_ID, '| Channel:', CHANNEL, '| Backup:', BACKUP_GROUP);
 
 // ═══════════════════════════════════════
 // 📁 IN-MEMORY DATABASE
 // ═══════════════════════════════════════
-let movies   = {};
-let requests = [];
-let users    = {};
-let banned   = {};
-
-// FIX #2: Use a plain map instead of ctx.session for upload state
-// grammY sessions are only reliable on message contexts, not callbacks
-const adminUploadState = new Map(); // userId -> upload state
-
-// FIX #3: Key adminEditState by userId (not chat.id) for consistency across message/callback ctxs
-let adminEditState = {}; // userId -> edit state
-let adminEditMode  = {}; // userId -> boolean
-let movieCounter   = 1;
-
+let movies       = {};
+let requests     = [];
+let users        = {};
+let banned       = {};
+let dailyQueue   = [];
+let movieCounter = 1;
+let adminEditMode = false;
+const adminEditState = {};
 const userLastSearch = new Map();
 
 // ═══════════════════════════════════════
-// 📅 DAILY QUEUE
-// ═══════════════════════════════════════
-let dailyQueue = [];
-
-async function loadDailyQueue() {
-  dailyQueue = await readJSON('dailyQueue.json', []);
-}
-async function saveDailyQueue() {
-  await writeJSON('dailyQueue.json', dailyQueue);
-}
-
-// ═══════════════════════════════════════
-// 🔍 FUSE.JS INDEX
-// ═══════════════════════════════════════
-let fuseIndex = null;
-function rebuildFuseIndex() {
-  fuseIndex = new Fuse(Object.values(movies), {
-    keys: ['name'],
-    threshold: 0.4,
-    includeScore: true
-  });
-}
-
-// ═══════════════════════════════════════
-// 💾 DB LOAD / SAVE
+// 💾 FILE HELPERS
 // ═══════════════════════════════════════
 async function readJSON(file, fallback) {
   try { return JSON.parse(await fs.readFile(file, 'utf8')); }
   catch { return fallback; }
 }
 async function writeJSON(file, data) {
-  await fs.writeFile(file, JSON.stringify(data, null, 2));
+  try { await fs.writeFile(file, JSON.stringify(data, null, 2), 'utf8'); }
+  catch (e) { console.error('writeJSON:', file, e.message); }
 }
-
 async function loadDB() {
-  movies   = await readJSON('movies.json', {});
-  requests = await readJSON('requests.json', []);
-  users    = await readJSON('users.json', {});
-  banned   = await readJSON('banned.json', {});
-  await loadDailyQueue();
+  movies     = await readJSON('movies.json',     {});
+  requests   = await readJSON('requests.json',   []);
+  users      = await readJSON('users.json',      {});
+  banned     = await readJSON('banned.json',     {});
+  dailyQueue = await readJSON('dailyQueue.json', []);
 
-  let needsMigration = false;
-  const newMovies = {};
+  const fixed = {};
   let counter = 1;
   for (const key in movies) {
     const m = movies[key];
-    if (key.startsWith('m_') && m.id?.startsWith('m_')) {
-      newMovies[key] = m;
+    if (key.startsWith('m_')) {
+      fixed[key] = m;
       const n = parseInt(key.slice(2));
       if (!isNaN(n) && n >= counter) counter = n + 1;
     } else {
-      needsMigration = true;
-      const newKey = `m_${counter}`;
-      newMovies[newKey] = { ...m, id: newKey, shortId: counter, downloads: m.downloads || 0 };
+      const nk = 'm_' + counter;
+      fixed[nk] = { ...m, id: nk, shortId: counter, downloads: m.downloads || 0 };
       counter++;
     }
   }
-  if (needsMigration) {
-    movies = newMovies;
-    await writeJSON('movies.json', movies);
-    console.log('✅ Migration done');
-  }
+  movies = fixed;
   movieCounter = counter;
-  rebuildFuseIndex();
+  await writeJSON('movies.json', movies);
+  rebuildFuse();
+  console.log('DB loaded:', Object.keys(movies).length, 'movies,', Object.keys(users).length, 'users');
+}
+async function saveMovies()   { await writeJSON('movies.json',     movies);     rebuildFuse(); }
+async function saveRequests() { await writeJSON('requests.json',   requests);   }
+async function saveUsers()    { await writeJSON('users.json',      users);      }
+async function saveBanned()   { await writeJSON('banned.json',     banned);     }
+async function saveQueue()    { await writeJSON('dailyQueue.json', dailyQueue); }
+
+// ═══════════════════════════════════════
+// 🔍 FUSE
+// ═══════════════════════════════════════
+let fuse = null;
+function rebuildFuse() {
+  fuse = new Fuse(Object.values(movies), { keys: ['name'], threshold: 0.4, includeScore: true });
 }
 
-async function saveDB()       { await writeJSON('movies.json', movies); rebuildFuseIndex(); }
-async function saveRequests() { await writeJSON('requests.json', requests); }
-async function saveUsers()    { await writeJSON('users.json', users); }
-async function saveBanned()   { await writeJSON('banned.json', banned); }
-
 // ═══════════════════════════════════════
-// 🛠️ UTILITIES
+// 🛠️ UTILS
 // ═══════════════════════════════════════
-function sanitize(str) {
+function clean(str) {
   if (typeof str !== 'string') return '';
   return str.replace(/[<>]/g, '').trim().slice(0, 200);
 }
 
-function escapeMarkdown(text) {
-  if (typeof text !== 'string') return '';
-  return text.replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
+// Escape for MarkdownV2
+function e(text) {
+  if (text === null || text === undefined) return '';
+  return String(text).replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
 }
 
 function fmtSize(bytes) {
   if (!bytes) return '';
-  const mb = bytes / (1024 * 1024);
-  return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`;
+  const mb = bytes / 1048576;
+  return mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : Math.round(mb) + ' MB';
 }
 
-function movieBtnLabel(m) {
-  const parts = [m.name];
-  if (m.year)     parts.push(m.year);
-  parts.push('|');
-  parts.push(m.language || 'N/A');
-  parts.push('|');
-  parts.push(m.quality  || 'N/A');
-  if (m.size)     parts.push('| ' + fmtSize(m.size));
-  return `⬇️ ${parts.join(' ')}`.slice(0, 60);
+function btnLabel(m) {
+  let s = 'DL ' + m.name;
+  if (m.year)     s += ' ' + m.year;
+  if (m.language) s += ' | ' + m.language;
+  if (m.quality)  s += ' | ' + m.quality;
+  if (m.size)     s += ' | ' + fmtSize(m.size);
+  return s.slice(0, 60);
 }
 
-// FIX #10: scheduleDelete always uses bot.api so it works from any context
-function scheduleDelete(chatId, ...msgIds) {
-  setTimeout(() => {
-    msgIds.forEach(id => {
-      if (id) bot.api.deleteMessage(chatId, id).catch(() => {});
-    });
-  }, AUTO_DELETE);
-}
+function isAdmin(ctx) { return ctx.from?.id === ADMIN_ID; }
 
-async function tempReply(ctx, text, options = {}) {
-  if (ctx.from?.id === ADMIN_ID) {
-    return ctx.reply(text, options);
-  }
-  try {
-    const msg = await ctx.reply(text, options);
-    const chatId = ctx.chat?.id || ctx.message?.chat?.id;
-    const userMsgId = ctx.message?.message_id;
-    if (chatId) {
-      scheduleDelete(chatId, msg.message_id, ...(userMsgId ? [userMsgId] : []));
-    }
-    return msg;
-  } catch (e) {
-    console.error('tempReply:', e.message);
-    return null;
-  }
-}
-
-async function tempPhoto(ctx, photo, options = {}) {
-  if (ctx.from?.id === ADMIN_ID) {
-    return ctx.replyWithPhoto(photo, options);
-  }
-  try {
-    const msg = await ctx.replyWithPhoto(photo, options);
-    const chatId = ctx.chat?.id || ctx.message?.chat?.id;
-    const userMsgId = ctx.message?.message_id;
-    if (chatId) {
-      scheduleDelete(chatId, msg.message_id, ...(userMsgId ? [userMsgId] : []));
-    }
-    return msg;
-  } catch (e) {
-    console.error('tempPhoto:', e.message);
-    return null;
-  }
-}
-
-async function tempAnim(ctx, anim, options = {}) {
-  if (ctx.from?.id === ADMIN_ID) {
-    return ctx.replyWithAnimation(anim, options);
-  }
-  try {
-    const msg = await ctx.replyWithAnimation(anim, options);
-    const chatId = ctx.chat?.id;
-    if (chatId) scheduleDelete(chatId, msg.message_id);
-    return msg;
-  } catch {
-    return tempReply(ctx, options.caption || 'Welcome!', { parse_mode: options.parse_mode });
-  }
-}
-
-function trackUser(userId, firstName, username) {
+function trackUser(ctx) {
+  const u = ctx.from;
+  if (!u) return;
   const now = new Date().toISOString();
-  if (!users[userId]) {
-    users[userId] = { id: userId, first_name: firstName || 'User', username: username || '',
-                      first_seen: now, last_seen: now, search_count: 0, downloads: 0 };
+  if (!users[u.id]) {
+    users[u.id] = { id: u.id, first_name: u.first_name || '', username: u.username || '',
+      first_seen: now, last_seen: now, search_count: 0, downloads: 0, website_visited: null };
   } else {
-    Object.assign(users[userId], { last_seen: now,
-      first_name: firstName || users[userId].first_name,
-      username:   username   || users[userId].username });
+    users[u.id].last_seen  = now;
+    users[u.id].first_name = u.first_name || users[u.id].first_name;
+    users[u.id].username   = u.username   || users[u.id].username;
   }
   saveUsers();
 }
 
-function hasVisitedWebsiteToday(userId) {
-  const user = users[userId];
-  if (!user || !user.lastWebsiteVisit) return false;
-  const lastVisit = new Date(user.lastWebsiteVisit);
-  const today = new Date();
-  return lastVisit.toDateString() === today.toDateString();
+function hasVisitedToday(uid) {
+  const v = users[uid]?.website_visited;
+  if (!v) return false;
+  return new Date(v).toDateString() === new Date().toDateString();
+}
+function markVisited(uid) {
+  if (users[uid]) { users[uid].website_visited = new Date().toISOString(); saveUsers(); }
 }
 
-function markWebsiteVisited(userId) {
-  if (!users[userId]) return;
-  users[userId].lastWebsiteVisit = new Date().toISOString();
-  saveUsers();
+function autoDelete(api, chatId, ...ids) {
+  setTimeout(() => ids.forEach(id => id && api.deleteMessage(chatId, id).catch(() => {})), AUTO_DELETE);
 }
 
-// FIX #4 & #6: rateLimit properly guards ctx.from and returns next() correctly
-const rlMap = new Map();
-async function rateLimit(ctx, next) {
-  const uid = ctx.from?.id;
-  if (!uid) return next();
-  const now = Date.now();
-  const d = rlMap.get(uid) || { count: 0, t: now };
-  if (now - d.t > 10000) { d.count = 1; d.t = now; }
-  else d.count++;
-  rlMap.set(uid, d);
-  if (d.count > 15) {
-    await ctx.reply('⚠️ Too many requests! Slow down a bit.').catch(() => {});
-    return;
-  }
-  return next();
-}
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// FIX #5: banCheck guards against undefined ctx.from (channel posts, etc.)
-async function banCheck(ctx, next) {
-  if (!ctx.from) return next();
-  if (banned[ctx.from.id]) {
-    await ctx.reply('🚫 You are banned.').catch(() => {});
-    return;
-  }
-  return next();
-}
-
-// FIX #1: mergeKeyboards moved ABOVE message handler so it's defined before use
-function mergeKeyboards(kb1, kb2) {
-  const merged = new InlineKeyboard();
-  const rows1 = kb1.inline_keyboard || [];
-  const rows2 = kb2.inline_keyboard || [];
-  [...rows1, ...rows2].forEach(row => {
-    if (row.length) merged.row(...row);
-  });
-  return merged;
-}
-
-// ═══════════════════════════════════════
-// 🎬 OMDB API CALLS
-// ═══════════════════════════════════════
-async function fetchOMDb(title) {
+// Safe reply — always returns message, falls back to plain if MarkdownV2 fails
+async function safeReply(ctx, text, opts = {}) {
   try {
-    const r = await axios.get(OMDB_BASE, {
-      params: { apikey: OMDB_API_KEY, t: title, plot: 'short' },
-      timeout: 5000
-    });
-    return r.data?.Response === 'True' ? r.data : null;
-  } catch (e) { console.error('OMDb:', e.message); return null; }
-}
-
-async function searchOMDb(query, year = '') {
-  try {
-    const r = await axios.get(OMDB_BASE, {
-      params: { apikey: OMDB_API_KEY, s: query, y: year, type: 'movie' },
-      timeout: 5000
-    });
-    return r.data?.Response === 'True' ? r.data.Search : [];
-  } catch (e) { console.error('OMDb search:', e.message); return []; }
-}
-
-// ═══════════════════════════════════════
-// 🇮🇳 INDIAN MOVIES FETCHERS
-// ═══════════════════════════════════════
-const INDIAN_KEYWORDS = [
-  'Bollywood', 'Hindi', 'Tamil', 'Telugu', 'Malayalam', 'Kannada',
-  'Shah Rukh Khan', 'Salman Khan', 'Aamir Khan', 'Akshay Kumar', 'Ajay Devgn',
-  'Rajinikanth', 'Vijay', 'Ajith', 'Allu Arjun', 'Prabhas', 'Yash'
-];
-
-async function getIndianMoviesByType(type = 'new', count = 5) {
-  const year = type === 'new' ? new Date().getFullYear() : new Date().getFullYear() + 1;
-  const allMovies = [];
-
-  for (const kw of INDIAN_KEYWORDS.slice(0, 8)) {
-    const res = await searchOMDb(kw, String(year));
-    allMovies.push(...res);
-    if (allMovies.length >= count * 3) break;
-    await new Promise(r => setTimeout(r, 200));
+    return await ctx.reply(text, opts);
+  } catch {
+    const plain = text.replace(/[\\*_`[\]()~>#+=|{}.!-]/g, '');
+    return await ctx.reply(plain, { reply_markup: opts.reply_markup }).catch(() => null);
   }
+}
 
-  const unique = [...new Map(allMovies.map(m => [m.imdbID, m])).values()];
-  const indianMovies = [];
+async function safePhoto(ctx, url, opts = {}) {
+  try {
+    return await ctx.replyWithPhoto(url, opts);
+  } catch {
+    return await safeReply(ctx, opts.caption || 'Movie found!', { reply_markup: opts.reply_markup });
+  }
+}
 
-  for (const m of unique) {
-    const details = await fetchOMDb(m.Title);
-    if (!details || !details.Poster || details.Poster === 'N/A') continue;
-
-    const lang    = (details.Language || '').toLowerCase();
-    const country = (details.Country  || '').toLowerCase();
-    const isIndian =
-      lang.includes('hindi') || lang.includes('tamil') || lang.includes('telugu') ||
-      lang.includes('malayalam') || lang.includes('kannada') ||
-      country.includes('india');
-
-    if (isIndian) {
-      indianMovies.push(details);
-      if (indianMovies.length >= count) break;
+// ═══════════════════════════════════════
+// 🔒 FORCE JOIN
+// ═══════════════════════════════════════
+async function checkMember(api, uid) {
+  if (uid === ADMIN_ID) return true;
+  for (const chat of [CHANNEL, BACKUP_GROUP]) {
+    try {
+      const m = await api.getChatMember(chat, uid);
+      if (['left', 'kicked'].includes(m.status)) return false;
+    } catch (err) {
+      console.warn('[JOIN CHECK]', chat, err.message);
     }
-    await new Promise(r => setTimeout(r, 200));
   }
-  return indianMovies;
+  return true;
+}
+
+async function enforceJoin(ctx) {
+  if (isAdmin(ctx)) return true;
+  const ok = await checkMember(ctx.api, ctx.from.id);
+  if (ok) return true;
+
+  const chLink = CHANNEL.startsWith('@') ? 'https://t.me/' + CHANNEL.slice(1) : 'https://t.me/cineradarai';
+  const bkLink = 'https://t.me/+Pj9i4fPv6kQwNmE1';
+
+  const kb = new InlineKeyboard()
+    .url('📢 Join Channel', chLink)
+    .url('🔒 Join Backup Group', bkLink)
+    .row()
+    .text('✅ I have joined', 'check_join');
+
+  await safeReply(ctx,
+    e('🔒 Access Restricted!\n\nCineRadar AI use karne ke liye join karein:\n📢 Channel: ') + e(CHANNEL) +
+    e('\n🔒 Backup Group: Private Group\n\nJoin karne ke baad ✅ tap karein.'),
+    { reply_markup: kb }
+  );
+  return false;
 }
 
 // ═══════════════════════════════════════
-// 🔍 SEARCH HELPERS
+// 🎬 OMDB
 // ═══════════════════════════════════════
-function searchMovies(query, filters = {}) {
+async function omdbFetch(title) {
+  try {
+    const r = await axios.get(OMDB_BASE, { params: { apikey: OMDB_API_KEY, t: title, plot: 'short' }, timeout: 7000 });
+    return r.data?.Response === 'True' ? r.data : null;
+  } catch { return null; }
+}
+async function omdbSearch(query, year = '') {
+  try {
+    const r = await axios.get(OMDB_BASE, { params: { apikey: OMDB_API_KEY, s: query, y: year, type: 'movie' }, timeout: 7000 });
+    return r.data?.Response === 'True' ? r.data.Search || [] : [];
+  } catch { return []; }
+}
+
+// ═══════════════════════════════════════
+// 🇮🇳 INDIAN MOVIES
+// ═══════════════════════════════════════
+const IND_KW = ['Bollywood','Hindi film','Tamil cinema','Telugu movie','Shah Rukh Khan','Salman Khan','Allu Arjun','Rajinikanth'];
+async function fetchIndian(type = 'new', count = 5) {
+  const year = type === 'new' ? new Date().getFullYear() : new Date().getFullYear() + 1;
+  const all  = [];
+  for (const kw of IND_KW) {
+    const r = await omdbSearch(kw, String(year));
+    all.push(...r);
+    if (all.length >= count * 4) break;
+    await delay(300);
+  }
+  const unique = [...new Map(all.map(m => [m.imdbID, m])).values()];
+  const result = [];
+  for (const m of unique) {
+    if (result.length >= count) break;
+    const d = await omdbFetch(m.Title);
+    if (!d?.Poster || d.Poster === 'N/A') continue;
+    const lang    = (d.Language || '').toLowerCase();
+    const country = (d.Country  || '').toLowerCase();
+    if (lang.includes('hindi') || lang.includes('tamil') || lang.includes('telugu') ||
+        lang.includes('malayalam') || lang.includes('kannada') || country.includes('india')) {
+      result.push(d);
+    }
+    await delay(200);
+  }
+  return result;
+}
+
+// ═══════════════════════════════════════
+// 🔍 SEARCH
+// ═══════════════════════════════════════
+function searchDB(query, filters = {}) {
   const q = query.toLowerCase();
   return Object.values(movies).filter(m => {
-    if (!m.name.toLowerCase().includes(q)) return false;
-    if (filters.language && (m.language || '').toLowerCase() !== filters.language.toLowerCase()) return false;
-    if (filters.quality  && (m.quality  || '').toLowerCase() !== filters.quality.toLowerCase())  return false;
-    if (filters.year     && String(m.year) !== String(filters.year))                             return false;
+    if (!m.name?.toLowerCase().includes(q)) return false;
+    if (filters.language && m.language?.toLowerCase() !== filters.language.toLowerCase()) return false;
+    if (filters.quality  && m.quality?.toLowerCase()  !== filters.quality.toLowerCase())  return false;
+    if (filters.year     && String(m.year) !== String(filters.year))                      return false;
     return true;
   });
 }
-
-function fuzzyMatch(query) {
-  if (!fuseIndex) return null;
-  const r = fuseIndex.search(query);
+function fuzzySearch(q) {
+  if (!fuse) return null;
+  const r = fuse.search(q);
   return r.length && r[0].score <= 0.4 ? r[0].item.name : null;
 }
 
-function groupMovies(list) {
-  const g = {};
-  list.forEach(m => {
-    const k = `${m.name.toLowerCase()}|${m.year || '0'}`;
-    if (!g[k]) g[k] = { displayName: m.name, year: m.year, items: [] };
-    g[k].items.push(m);
-  });
-  return Object.values(g);
-}
-
-function buildFilterKeyboard(query, results) {
-  const years = [...new Set(results.map(m => m.year).filter(Boolean))].sort().reverse();
-  const langs  = [...new Set(results.map(m => m.language).filter(Boolean))].sort();
-  const quals  = [...new Set(results.map(m => m.quality).filter(Boolean))].sort();
-
-  const kb = new InlineKeyboard();
-  if (years.length > 1) {
-    years.slice(0, 5).forEach(y => kb.text(`📅 ${y}`, `f|${query}|year|${y}`));
-    kb.row();
-  }
-  if (langs.length > 1) {
-    langs.slice(0, 4).forEach(l => kb.text(`🌐 ${l}`, `f|${query}|lang|${l}`));
-    kb.row();
-  }
-  if (quals.length > 1) {
-    quals.slice(0, 5).forEach(q => kb.text(`📺 ${q}`, `f|${query}|qual|${q}`));
-    kb.row();
-  }
-  if (years.length > 1 || langs.length > 1 || quals.length > 1) {
-    kb.text(`🔄 All (${results.length})`, `f|${query}|all|all`);
-  }
-  return kb;
-}
-
-// ═══════════════════════════════════════
-// 🔍 SMART QUERY PARSER
-// ═══════════════════════════════════════
-const KNOWN_LANGUAGES = [
-  'hindi', 'english', 'tamil', 'telugu', 'malayalam', 'kannada',
-  'dual audio', 'multi audio', 'punjabi', 'bengali', 'marathi'
-];
-
-function parseQuery(rawQuery) {
-  const query = rawQuery.toLowerCase().trim();
-
-  const yearMatch = query.match(/\b(19\d{2}|20\d{2})\b/);
-  const year = yearMatch ? yearMatch[0] : null;
-
-  let namePart = query.replace(/\b(19\d{2}|20\d{2})\b/, '').trim();
-
+const LANGS = ['hindi','english','tamil','telugu','malayalam','kannada','dual audio','multi audio','punjabi','bengali','marathi'];
+function parseQuery(raw) {
+  let q = raw.toLowerCase().trim();
+  const ym = q.match(/\b(19|20)\d{2}\b/);
+  const year = ym ? ym[0] : null;
+  if (year) q = q.replace(year, '').trim();
   let language = null;
-  const sortedLangs = [...KNOWN_LANGUAGES].sort((a, b) => b.length - a.length);
-  for (const lang of sortedLangs) {
-    const regex = new RegExp(`\\b${lang}\\b`, 'i');
-    if (regex.test(namePart)) {
-      language = lang.charAt(0).toUpperCase() + lang.slice(1);
-      namePart = namePart.replace(regex, '').trim();
+  for (const l of [...LANGS].sort((a,b) => b.length - a.length)) {
+    if (new RegExp('\\b' + l + '\\b', 'i').test(q)) {
+      language = l.split(' ').map(w => w[0].toUpperCase() + w.slice(1)).join(' ');
+      q = q.replace(new RegExp('\\b' + l + '\\b', 'i'), '').trim();
       break;
     }
   }
+  return { movieName: q.replace(/\s+/g, ' ').trim() || raw, year, language };
+}
 
-  let movieName = namePart.replace(/\s+/g, ' ').trim();
-  if (!movieName) movieName = query;
-
-  return { movieName, year, language };
+function filterKB(query, results) {
+  const years = [...new Set(results.map(m => m.year).filter(Boolean))].sort().reverse();
+  const langs  = [...new Set(results.map(m => m.language).filter(Boolean))].sort();
+  const quals  = [...new Set(results.map(m => m.quality).filter(Boolean))].sort();
+  const kb = new InlineKeyboard();
+  if (years.length > 1) { years.slice(0,5).forEach(y => kb.text('Y:' + y, 'f|' + query + '|year|' + y)); kb.row(); }
+  if (langs.length > 1) { langs.slice(0,4).forEach(l => kb.text('L:' + l, 'f|' + query + '|lang|' + l)); kb.row(); }
+  if (quals.length > 1) { quals.slice(0,5).forEach(q => kb.text('Q:' + q, 'f|' + query + '|qual|' + q)); kb.row(); }
+  if (years.length > 1 || langs.length > 1 || quals.length > 1) kb.text('All (' + results.length + ')', 'f|' + query + '|all|all');
+  return kb;
+}
+function mergeKB(kb1, kb2) {
+  const out  = new InlineKeyboard();
+  [...(kb1.inline_keyboard || []), ...(kb2.inline_keyboard || [])].forEach(row => { if (row?.length) out.row(...row); });
+  return out;
 }
 
 // ═══════════════════════════════════════
-// 🤖 BOT INIT
+// 📤 DELIVER MOVIE
 // ═══════════════════════════════════════
-const bot = new Bot(BOT_TOKEN);
-// Keep session middleware but we no longer rely on it for upload state
-bot.use(session({ initial: () => ({}) }));
+async function deliverMovie(ctx, movie) {
+  const uid = ctx.from.id;
+  movie.downloads = (movie.downloads || 0) + 1;
+  if (users[uid]) users[uid].downloads = (users[uid].downloads || 0) + 1;
+  saveMovies(); saveUsers();
 
-// ═══════════════════════════════════════
-// 🧹 Global auto-delete for non-admin user messages (3 minutes)
-// ═══════════════════════════════════════
-bot.use(async (ctx, next) => {
-  await next();
-
-  const msg = ctx.message;
-  if (!msg) return;
-
-  const userId = ctx.from?.id;
-  if (!userId || userId === ADMIN_ID) return;
-
-  setTimeout(() => {
-    bot.api.deleteMessage(ctx.chat.id, msg.message_id).catch(() => {});
-  }, AUTO_DELETE);
-});
-
-bot.use(rateLimit);
-bot.use(banCheck);
-
-loadDB().then(() => console.log('📀 DB loaded'));
-
-// ═══════════════════════════════════════
-// 🛠️ UPLOAD FINISH HELPER
-// ═══════════════════════════════════════
-async function finishUpload(ctx, state) {
-  const key = `m_${movieCounter}`;
-  movies[key] = {
-    id: key, shortId: movieCounter,
-    file_id:  state.file_id,
-    name:     state.name,
-    year:     state.year,
-    language: state.language,
-    quality:  state.quality,
-    size:     state.size || null,
-    downloads: 0,
-    added: new Date().toISOString()
-  };
-  movieCounter++;
-  await saveDB();
-  // FIX #2: clear from map instead of session
-  adminUploadState.delete(ctx.from.id);
-
-  const caption =
-    `✅ *Movie Saved!*\n\n` +
-    `🎬 ${escapeMarkdown(state.name)} (${state.year})\n` +
-    `🌐 ${state.language} | 📺 ${state.quality}` +
-    `${state.size ? ' | ' + fmtSize(state.size) : ''}\n` +
-    `🆔 ID: \`${key}\``;
+  const cap =
+    '🎬 ' + e(movie.name) + ' \\(' + e(movie.year || '?') + '\\)\n' +
+    '🌐 ' + e(movie.language || 'N/A') + ' \\| 📺 ' + e(movie.quality || 'N/A') +
+    (movie.size ? ' \\| ' + e(fmtSize(movie.size)) : '') + '\n\n' +
+    '⏱ Auto\\-deletes in 3 min — forward \\& save\\!';
 
   const kb = new InlineKeyboard()
-    .text('📢 Post to Channel', `post_to_channel_${key}`)
-    .text('❌ No', 'dismiss_post');
+    .url('🌐 Visit Website', WEBSITE_URL)
+    .url('📷 Instagram', INSTAGRAM_URL);
 
-  return ctx.reply(caption, { parse_mode: 'Markdown', reply_markup: kb });
+  try {
+    const sent = await ctx.replyWithVideo(movie.file_id, { caption: cap, parse_mode: 'MarkdownV2', reply_markup: kb });
+    if (!isAdmin(ctx)) autoDelete(ctx.api, ctx.chat.id, sent.message_id);
+    await ctx.answerCallbackQuery({ text: 'Sending: ' + movie.name });
+  } catch (err) {
+    console.error('[DELIVER]', err.message);
+    await ctx.answerCallbackQuery({ text: 'Error sending file', show_alert: true });
+  }
 }
 
 // ═══════════════════════════════════════
-// 🟢 COMMANDS
+// 🤖 BOT
+// ═══════════════════════════════════════
+const bot = new Bot(BOT_TOKEN);
+bot.use(session({ initial: () => ({ upload: null }) }));
+
+// Rate limit
+const rl = new Map();
+bot.use(async (ctx, next) => {
+  const uid = ctx.from?.id;
+  if (!uid || uid === ADMIN_ID) return next();
+  const now = Date.now();
+  const d = rl.get(uid) || { n: 0, t: now };
+  if (now - d.t > 10000) { d.n = 1; d.t = now; } else d.n++;
+  rl.set(uid, d);
+  if (d.n > 15) return ctx.reply('Too many requests! Slow down.').catch(() => {});
+  return next();
+});
+
+// Ban check
+bot.use(async (ctx, next) => {
+  if (banned[ctx.from?.id]) return ctx.reply('You are banned.').catch(() => {});
+  return next();
+});
+
+// Auto-delete user messages
+bot.use(async (ctx, next) => {
+  await next();
+  if (!ctx.message || isAdmin(ctx)) return;
+  setTimeout(() => ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => {}), AUTO_DELETE);
+});
+
+// ═══════════════════════════════════════
+// ✅ COMMANDS
 // ═══════════════════════════════════════
 bot.command('start', async ctx => {
-  trackUser(ctx.from.id, ctx.from.first_name, ctx.from.username);
-  const safeFirstName = escapeMarkdown(ctx.from.first_name);
-  await tempAnim(ctx, WELCOME_GIF, {
-    caption: `🎬 *Welcome to CineRadar AI, ${safeFirstName}\\!*\n\n🔍 Type movie name \\(min 3 chars\\) to search\\.\n⏱️ Messages auto\\-delete in 3 minutes\\. Forward and save\\.\n💡 *Visit our website daily for 3x download speed\\!*`,
-    parse_mode: 'MarkdownV2'
-  });
+  trackUser(ctx);
+  if (!(await enforceJoin(ctx))) return;
+  const name = e(ctx.from.first_name || 'Friend');
+  try {
+    const msg = await ctx.replyWithAnimation(WELCOME_GIF, {
+      caption: '🎬 *Welcome to CineRadar AI, ' + name + '\\!*\n\n🔍 Movie naam type karein \\(min 3 chars\\)\n⏱ Messages 3 min mein auto\\-delete\n💡 Website daily visit karein 3x speed ke liye\\!',
+      parse_mode: 'MarkdownV2'
+    });
+    if (!isAdmin(ctx)) autoDelete(ctx.api, ctx.chat.id, msg.message_id);
+  } catch {
+    const msg = await ctx.reply('Welcome to CineRadar AI, ' + (ctx.from.first_name || 'Friend') + '! Type a movie name to search.');
+    if (!isAdmin(ctx)) autoDelete(ctx.api, ctx.chat.id, msg.message_id);
+  }
 });
 
 bot.command('help', async ctx => {
-  const helpText =
-    `🎬 *CineRadar AI — Commands*\n\n` +
-    `🔍 *Search:* Just type movie name (min 3 chars)\n` +
-    `📺 *Filters:* Year / Language / Quality buttons appear after search\n` +
-    `📩 *Request:* Button appears if movie not found\n\n` +
-    `🆕 /new — New Bollywood & South Indian releases\n` +
-    `🔮 /upcoming — Upcoming Indian movies\n` +
-    `📋 /myrequests — Track your requests\n\n` +
-    `⚡ *3x Speed:* Visit our website daily to unlock fast downloads\n\n` +
-    `👑 *Admin only:* /edit, /stats, /broadcast, /delete, /ban, /unban, /pending, /search\n` +
-    `               /queue\\_add, /queue\\_view, /queue\\_clear`;
-  await tempReply(ctx, helpText, { parse_mode: 'Markdown' });
+  trackUser(ctx);
+  if (!(await enforceJoin(ctx))) return;
+  let txt =
+    '🎬 *CineRadar AI*\n\n' +
+    '🔍 Movie naam type karein \\(min 3 chars\\)\n' +
+    '📩 Request button milega agar movie nahi mili\n\n' +
+    '/new — New Indian releases\n' +
+    '/upcoming — Upcoming movies\n' +
+    '/myrequests — Apne requests';
+  if (isAdmin(ctx)) {
+    txt += '\n\n👑 *Admin:*\n' +
+    '/stats /pending /search /delete /broadcast\n' +
+    '/ban /unban /edit /queue\\_add /queue\\_view /queue\\_clear';
+  }
+  const msg = await safeReply(ctx, txt, { parse_mode: 'MarkdownV2' });
+  if (msg && !isAdmin(ctx)) autoDelete(ctx.api, ctx.chat.id, msg.message_id);
 });
 
 bot.command('new', async ctx => {
-  const loading = await ctx.reply('🔄 Fetching new Indian releases...');
+  trackUser(ctx);
+  if (!(await enforceJoin(ctx))) return;
+  const loader = await ctx.reply('Fetching new Indian releases...');
   try {
-    const moviesList = await getIndianMoviesByType('new', 5);
-    await bot.api.deleteMessage(ctx.chat.id, loading.message_id).catch(() => {});
-    if (!moviesList.length) return tempReply(ctx, '❌ No new Indian movies found.');
-    for (const m of moviesList) {
-      const caption =
-        `🆕 *${escapeMarkdown(m.Title)}* (${m.Year})\n` +
-        `⭐ IMDb: ${m.imdbRating || 'N/A'}\n` +
-        `🎭 ${escapeMarkdown(m.Genre || '')}\n` +
-        `📖 ${escapeMarkdown(m.Plot || '')}\n\n` +
-        `💡 *Visit our website for 3x download speed!*`;
+    const list = await fetchIndian('new', 5);
+    ctx.api.deleteMessage(ctx.chat.id, loader.message_id).catch(() => {});
+    if (!list.length) return ctx.reply('No new Indian movies found right now.');
+    for (const m of list) {
       const kb = new InlineKeyboard()
-        .text('📩 Request', `request_${encodeURIComponent(m.Title)}`)
-        .url('🌐 Visit Website (3x download Speed)', WEBSITE_URL)
-        .row()
-        .url('📷 Instagram', INSTAGRAM_URL);
-      await tempPhoto(ctx, m.Poster, { caption, parse_mode: 'Markdown', reply_markup: kb });
-      await new Promise(r => setTimeout(r, 500));
+        .text('📩 Request', 'request_' + encodeURIComponent(m.Title))
+        .row().url('🌐 Website', WEBSITE_URL).url('📷 Instagram', INSTAGRAM_URL);
+      const cap = '🆕 *' + e(m.Title) + '* \\(' + e(m.Year) + '\\)\n⭐ ' + e(m.imdbRating||'N/A') + '\n🎭 ' + e(m.Genre||'') + '\n📖 ' + e((m.Plot||'').slice(0,200));
+      const sent = await safePhoto(ctx, m.Poster, { caption: cap, parse_mode: 'MarkdownV2', reply_markup: kb });
+      if (sent && !isAdmin(ctx)) autoDelete(ctx.api, ctx.chat.id, sent.message_id);
+      await delay(600);
     }
-  } catch (e) {
-    await bot.api.deleteMessage(ctx.chat.id, loading.message_id).catch(() => {});
-    await tempReply(ctx, '❌ Error fetching new movies.');
+  } catch (err) {
+    ctx.api.deleteMessage(ctx.chat.id, loader.message_id).catch(() => {});
+    ctx.reply('Error fetching movies. Try again later.');
+    console.error('[NEW]', err.message);
   }
 });
 
 bot.command('upcoming', async ctx => {
-  const loading = await ctx.reply('🔄 Fetching upcoming Indian movies...');
+  trackUser(ctx);
+  if (!(await enforceJoin(ctx))) return;
+  const loader = await ctx.reply('Fetching upcoming Indian movies...');
   try {
-    const moviesList = await getIndianMoviesByType('upcoming', 5);
-    await bot.api.deleteMessage(ctx.chat.id, loading.message_id).catch(() => {});
-    if (!moviesList.length) return tempReply(ctx, '❌ No upcoming Indian movies found.');
-    for (const m of moviesList) {
-      const caption =
-        `🔮 *${escapeMarkdown(m.Title)}* (${m.Year})\n` +
-        `⭐ IMDb: ${m.imdbRating || 'N/A'}\n` +
-        `🎭 ${escapeMarkdown(m.Genre || '')}\n` +
-        `📖 ${escapeMarkdown(m.Plot || '')}\n\n` +
-        `💡 *Visit our website for 3x download speed!*`;
+    const list = await fetchIndian('upcoming', 5);
+    ctx.api.deleteMessage(ctx.chat.id, loader.message_id).catch(() => {});
+    if (!list.length) return ctx.reply('No upcoming movies found right now.');
+    for (const m of list) {
       const kb = new InlineKeyboard()
-        .text('📩 Request', `request_${encodeURIComponent(m.Title)}`)
-        .url('🌐 Visit Website (3x Speed)', WEBSITE_URL)
-        .row()
-        .url('📷 Instagram', INSTAGRAM_URL);
-      await tempPhoto(ctx, m.Poster, { caption, parse_mode: 'Markdown', reply_markup: kb });
-      await new Promise(r => setTimeout(r, 500));
+        .text('📩 Request', 'request_' + encodeURIComponent(m.Title))
+        .row().url('🌐 Website', WEBSITE_URL).url('📷 Instagram', INSTAGRAM_URL);
+      const cap = '🔮 *' + e(m.Title) + '* \\(' + e(m.Year) + '\\)\n⭐ ' + e(m.imdbRating||'N/A') + '\n🎭 ' + e(m.Genre||'') + '\n📖 ' + e((m.Plot||'').slice(0,200));
+      const sent = await safePhoto(ctx, m.Poster, { caption: cap, parse_mode: 'MarkdownV2', reply_markup: kb });
+      if (sent && !isAdmin(ctx)) autoDelete(ctx.api, ctx.chat.id, sent.message_id);
+      await delay(600);
     }
-  } catch (e) {
-    await bot.api.deleteMessage(ctx.chat.id, loading.message_id).catch(() => {});
-    await tempReply(ctx, '❌ Error fetching upcoming movies.');
+  } catch (err) {
+    ctx.api.deleteMessage(ctx.chat.id, loader.message_id).catch(() => {});
+    ctx.reply('Error fetching movies. Try again later.');
+    console.error('[UPCOMING]', err.message);
   }
 });
 
 bot.command('myrequests', async ctx => {
+  trackUser(ctx);
+  if (!(await enforceJoin(ctx))) return;
   const uid  = ctx.from.id;
-  const reqs = requests.filter(r => r.user === uid);
-  if (!reqs.length) return tempReply(ctx, "📭 You haven't requested any movies yet.");
-  let txt = `📩 *Your Requests (${reqs.length})*\n\n`;
-  reqs.slice(-10).forEach((r, i) => {
-    txt += `${i + 1}. 🎬 ${escapeMarkdown(r.movie)}\n   ${r.status || 'Pending'} — ${new Date(r.time).toLocaleDateString()}\n`;
+  const mine = requests.filter(r => r.user === uid);
+  if (!mine.length) return ctx.reply('You have not made any requests yet.').then(m => { if (!isAdmin(ctx)) autoDelete(ctx.api, ctx.chat.id, m.message_id); });
+  let txt = '📩 *Your Requests \\(' + mine.length + '\\)*\n\n';
+  mine.slice(-10).forEach((r, i) => {
+    txt += (i+1) + '\\. *' + e(r.movie) + '*\n   ' + e(r.status||'Pending') + ' — ' + new Date(r.time).toLocaleDateString() + '\n\n';
   });
-  await tempReply(ctx, txt, { parse_mode: 'Markdown' });
+  const msg = await safeReply(ctx, txt, { parse_mode: 'MarkdownV2' });
+  if (msg && !isAdmin(ctx)) autoDelete(ctx.api, ctx.chat.id, msg.message_id);
 });
 
-// ─── ADMIN COMMANDS ──────────────────────────────────────────
-bot.command('edit', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
-  adminEditMode[ctx.from.id] = !adminEditMode[ctx.from.id];
-  ctx.reply(`✏️ Edit mode ${adminEditMode[ctx.from.id] ? '✅ ON' : '❌ OFF'}`);
-});
-
+// ─── ADMIN COMMANDS ───────────────────────────────────────────
 bot.command('stats', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
-  const totalDL = Object.values(movies).reduce((s, m) => s + (m.downloads || 0), 0);
-  ctx.reply(
-    `📊 *Bot Statistics*\n\n` +
-    `🎬 Movies: ${Object.keys(movies).length}\n` +
-    `👥 Users: ${Object.keys(users).length}\n` +
-    `⬇️ Total Downloads: ${totalDL}\n` +
-    `📩 Pending Requests: ${requests.filter(r => !r.status || r.status === 'Pending').length}\n` +
-    `🚫 Banned: ${Object.keys(banned).length}`,
-    { parse_mode: 'Markdown' });
-});
-
-bot.command('broadcast', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
-  const text = ctx.message.text.replace('/broadcast', '').trim();
-  if (!text) return ctx.reply('Usage: /broadcast <message>');
-  const ids = Object.keys(users);
-  await ctx.reply(`📢 Sending to ${ids.length} users...`);
-  let ok = 0, fail = 0;
-  for (const uid of ids) {
-    try {
-      await ctx.api.sendMessage(uid, `📢 *Announcement*\n\n${escapeMarkdown(text)}`, { parse_mode: 'Markdown' });
-      ok++;
-    } catch { fail++; }
-    await new Promise(r => setTimeout(r, 50));
+  if (!isAdmin(ctx)) return ctx.reply('Admin only.');
+  const totalDL   = Object.values(movies).reduce((s, m) => s + (m.downloads || 0), 0);
+  const pending   = requests.filter(r => !r.status || r.status === 'Pending').length;
+  const fulfilled = requests.filter(r => r.status === 'Fulfilled').length;
+  const top5      = Object.values(movies).sort((a,b)=>(b.downloads||0)-(a.downloads||0)).slice(0,5);
+  let txt =
+    '📊 *CineRadar AI Stats*\n\n' +
+    '🎬 Movies: *' + Object.keys(movies).length + '*\n' +
+    '👥 Users: *' + Object.keys(users).length + '*\n' +
+    '⬇️ Total Downloads: *' + totalDL + '*\n' +
+    '📩 Pending: *' + pending + '*\n' +
+    '✅ Fulfilled: *' + fulfilled + '*\n' +
+    '🚫 Banned: *' + Object.keys(banned).length + '*';
+  if (top5.length) {
+    txt += '\n\n🏆 *Top Downloads:*\n';
+    top5.forEach((m,i) => { txt += (i+1) + '\\. ' + e(m.name) + ' — ' + (m.downloads||0) + '\n'; });
   }
-  ctx.reply(`✅ Done — Success: ${ok} | Failed: ${fail}`);
-});
-
-bot.command('delete', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
-  const id = ctx.message.text.replace('/delete', '').trim();
-  if (!movies[id]) return ctx.reply('❌ Movie not found. Use /search to find IDs.');
-  const name = movies[id].name;
-  delete movies[id];
-  await saveDB();
-  ctx.reply(`✅ Deleted: ${escapeMarkdown(name)}`);
-});
-
-bot.command('ban', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
-  const id = ctx.message.text.replace('/ban', '').trim();
-  if (!id) return ctx.reply('Usage: /ban <userId>');
-  banned[id] = true;
-  await saveBanned();
-  ctx.reply(`✅ Banned: ${id}`);
-});
-
-bot.command('unban', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
-  const id = ctx.message.text.replace('/unban', '').trim();
-  delete banned[id];
-  await saveBanned();
-  ctx.reply(`✅ Unbanned: ${id}`);
+  safeReply(ctx, txt, { parse_mode: 'MarkdownV2' });
 });
 
 bot.command('pending', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!isAdmin(ctx)) return ctx.reply('Admin only.');
   const pend = requests.filter(r => !r.status || r.status === 'Pending');
-  if (!pend.length) return ctx.reply('✅ No pending requests.');
-  let txt = `📩 *Pending Requests (${pend.length})*\n\n`;
-  const kb = new InlineKeyboard();
-  pend.slice(0, 20).forEach((r, i) => {
-    txt += `${i + 1}. 🎬 ${escapeMarkdown(r.movie)} (User: ${r.user})\n`;
-    kb.text(`✅ ${r.movie.slice(0, 20)}`, `req_done_${r.user}_${encodeURIComponent(r.movie)}`).row();
-  });
-  ctx.reply(txt, { parse_mode: 'Markdown', reply_markup: kb });
+  if (!pend.length) return ctx.reply('No pending requests!');
+  for (let i = 0; i < pend.length; i += 8) {
+    const batch = pend.slice(i, i + 8);
+    let txt = i === 0 ? '📩 *Pending \\(' + pend.length + '\\)*\n\n' : '*Continued*\n\n';
+    const kb = new InlineKeyboard();
+    batch.forEach((r, j) => {
+      txt += (i+j+1) + '\\. *' + e(r.movie) + '*\n   ID: `' + r.user + '` — ' + new Date(r.time).toLocaleDateString() + '\n\n';
+      kb.text('Done: ' + r.movie.slice(0,20), 'req_done_' + r.user + '_' + encodeURIComponent(r.movie)).row();
+    });
+    await safeReply(ctx, txt, { parse_mode: 'MarkdownV2', reply_markup: kb });
+    await delay(300);
+  }
+});
+
+bot.command('broadcast', async ctx => {
+  if (!isAdmin(ctx)) return ctx.reply('Admin only.');
+  const text = ctx.message.text.replace('/broadcast', '').trim();
+  if (!text) return ctx.reply('Usage: /broadcast <message>');
+  const ids = Object.keys(users);
+  const status = await ctx.reply('Sending to ' + ids.length + ' users...');
+  let ok = 0, fail = 0;
+  for (const uid of ids) {
+    try { await ctx.api.sendMessage(Number(uid), '📢 Announcement\n\n' + text); ok++; }
+    catch { fail++; }
+    await delay(60);
+  }
+  ctx.api.editMessageText(ctx.chat.id, status.message_id, 'Done! Success: ' + ok + ' | Failed: ' + fail).catch(() => ctx.reply('Done! Success: ' + ok + ' | Failed: ' + fail));
+});
+
+bot.command('delete', async ctx => {
+  if (!isAdmin(ctx)) return ctx.reply('Admin only.');
+  const id = ctx.message.text.replace('/delete', '').trim();
+  if (!id) return ctx.reply('Usage: /delete <id>  e.g. /delete m_5');
+  if (!movies[id]) return ctx.reply('Movie "' + id + '" not found. Use /search to find IDs.');
+  const name = movies[id].name;
+  delete movies[id];
+  await saveMovies();
+  ctx.reply('Deleted: ' + name);
 });
 
 bot.command('search', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!isAdmin(ctx)) return ctx.reply('Admin only.');
   const q = ctx.message.text.replace('/search', '').trim();
   if (!q) return ctx.reply('Usage: /search <name>');
-  const res = searchMovies(q);
-  if (!res.length) return ctx.reply('❌ No results.');
-  let txt = `🔍 *${res.length} result(s) for "${escapeMarkdown(q)}"*\n\n`;
-  res.slice(0, 15).forEach(m => {
-    txt += `\`${m.id}\` — ${escapeMarkdown(m.name)} (${m.year || '?'}) | ${m.language || '?'} | ${m.quality || '?'}${m.size ? ' | ' + fmtSize(m.size) : ''}\n`;
+  const res = searchDB(q);
+  if (!res.length) return ctx.reply('No results for "' + q + '".');
+  let txt = '🔍 *' + res.length + ' result\\(s\\) for "' + e(q) + '"*\n\n';
+  res.slice(0, 20).forEach(m => {
+    txt += '`' + m.id + '` — *' + e(m.name) + '* \\(' + e(m.year||'?') + '\\) \\| ' + e(m.language||'?') + ' \\| ' + e(m.quality||'?') + (m.size ? ' \\| ' + e(fmtSize(m.size)) : '') + '\n';
   });
-  ctx.reply(txt, { parse_mode: 'Markdown' });
+  safeReply(ctx, txt, { parse_mode: 'MarkdownV2' });
 });
 
-// ─── ADMIN: DAILY QUEUE MANAGEMENT ──────────────────────────
+bot.command('ban', async ctx => {
+  if (!isAdmin(ctx)) return ctx.reply('Admin only.');
+  const id = ctx.message.text.replace('/ban', '').trim();
+  if (!id || isNaN(Number(id))) return ctx.reply('Usage: /ban <userId>');
+  banned[id] = true; await saveBanned();
+  ctx.reply('Banned: ' + id);
+});
+
+bot.command('unban', async ctx => {
+  if (!isAdmin(ctx)) return ctx.reply('Admin only.');
+  const id = ctx.message.text.replace('/unban', '').trim();
+  if (!id) return ctx.reply('Usage: /unban <userId>');
+  delete banned[id]; await saveBanned();
+  ctx.reply('Unbanned: ' + id);
+});
+
+bot.command('edit', async ctx => {
+  if (!isAdmin(ctx)) return ctx.reply('Admin only.');
+  adminEditMode = !adminEditMode;
+  ctx.reply('Edit mode: ' + (adminEditMode ? 'ON' : 'OFF'));
+});
+
 bot.command('queue_add', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!isAdmin(ctx)) return ctx.reply('Admin only.');
   const args = ctx.message.text.split(' ').slice(1);
   if (args.length < 2) return ctx.reply('Usage: /queue_add new|upcoming <movie name>');
   const type = args[0].toLowerCase();
-  if (type !== 'new' && type !== 'upcoming') return ctx.reply('Type must be "new" or "upcoming".');
-  const movieName = args.slice(1).join(' ');
-
-  const omdb = await fetchOMDb(movieName);
-  if (!omdb || !omdb.Poster || omdb.Poster === 'N/A') {
-    return ctx.reply('❌ Movie not found on OMDb.');
-  }
-
-  const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+  if (!['new','upcoming'].includes(type)) return ctx.reply('Type must be new or upcoming.');
+  const name = args.slice(1).join(' ');
+  const data = await omdbFetch(name);
+  if (!data?.Poster || data.Poster === 'N/A') return ctx.reply('Movie not found on OMDb.');
+  const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0,10);
   let entry = dailyQueue.find(e => e.date === tomorrow);
-  if (!entry) {
-    entry = { date: tomorrow, items: [] };
-    dailyQueue.push(entry);
-  }
-  entry.items.push({ type, movieData: omdb });
-  await saveDailyQueue();
-  ctx.reply(`✅ "${omdb.Title}" added to ${type} queue for ${tomorrow}.`);
+  if (!entry) { entry = { date: tomorrow, items: [] }; dailyQueue.push(entry); }
+  entry.items.push({ type, movieData: data });
+  await saveQueue();
+  ctx.reply('Added "' + data.Title + '" to ' + type + ' queue for ' + tomorrow);
 });
 
 bot.command('queue_view', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
-  if (dailyQueue.length === 0) return ctx.reply('📭 Queue is empty.');
-
-  let text = '📋 *Daily Post Queue*\n\n';
-  for (const entry of dailyQueue.sort((a, b) => a.date.localeCompare(b.date))) {
-    text += `*${entry.date}*\n`;
-    entry.items.forEach(item => {
-      text += `  ${item.type === 'new' ? '🆕' : '🔮'} ${escapeMarkdown(item.movieData.Title)} (${item.movieData.Year})\n`;
-    });
-  }
-  await ctx.reply(text, { parse_mode: 'Markdown' });
+  if (!isAdmin(ctx)) return ctx.reply('Admin only.');
+  if (!dailyQueue.length) return ctx.reply('Queue is empty.');
+  let txt = 'Queue:\n\n';
+  dailyQueue.sort((a,b) => a.date.localeCompare(b.date)).forEach(en => {
+    txt += en.date + ':\n';
+    en.items.forEach(i => { txt += '  ' + (i.type==='new'?'NEW':'UPCOMING') + ': ' + i.movieData.Title + '\n'; });
+  });
+  ctx.reply(txt);
 });
 
 bot.command('queue_clear', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
-  dailyQueue = [];
-  await saveDailyQueue();
-  ctx.reply('✅ Queue cleared.');
+  if (!isAdmin(ctx)) return ctx.reply('Admin only.');
+  dailyQueue = []; await saveQueue();
+  ctx.reply('Queue cleared.');
 });
 
 // ═══════════════════════════════════════
-// 👋 WELCOME HANDLERS
+// 👋 GROUP EVENTS
 // ═══════════════════════════════════════
 bot.on('message:new_chat_members', async ctx => {
-  const newMembers = ctx.message.new_chat_members;
-  for (const member of newMembers) {
+  for (const member of (ctx.message.new_chat_members || [])) {
     if (member.id === ctx.me.id) continue;
-    const firstName = escapeMarkdown(member.first_name);
-    const welcomeMsg =
-      `👋 Welcome ${firstName}\\!\n\n` +
-      `🎬 *CineRadar AI* me aapka swagat hai\\.\n` +
-      `📌 Movie paane ke liye bas movie ka naam type karein \\(minimum 3 letters\\)\\.\n` +
-      `🔍 Example: *Krish*\n\n` +
-      `💡 *Website visit karein daily 3x speed download ke liye\\!*\n\n` +
-      `🔥 Enjoy HD Movies\\!`;
-    try {
-      await tempReply(ctx, welcomeMsg, { parse_mode: 'MarkdownV2' });
-    } catch (e) {
-      console.error('Group welcome error:', e.message);
-    }
+    ctx.reply('Welcome ' + (member.first_name||'') + '! Type a movie name to search. /help for commands.').catch(() => {});
   }
 });
 
 bot.on('my_chat_member', async ctx => {
-  const chatId    = ctx.chat.id;
-  const newStatus = ctx.update.my_chat_member.new_chat_member.status;
-  const oldStatus = ctx.update.my_chat_member.old_chat_member.status;
-
-  if (newStatus === 'member' && oldStatus !== 'member') {
-    const helpText =
-      `🤖 *CineRadar AI is now active in this group\\!*\n\n` +
-      `🎬 *Available Commands:*\n` +
-      `• Type movie name \\(min 3 letters\\) — Search & download\n` +
-      `• /new — New Bollywood & South releases\n` +
-      `• /upcoming — Upcoming Indian movies\n` +
-      `• /myrequests — Track your requests\n` +
-      `• /help — Show this message\n\n` +
-      `⚡ *3x Speed:* Visit ${WEBSITE_URL} daily to unlock fast downloads\n\n` +
-      `📌 *This message is pinned for easy access\\.*\n` +
-      `🔞 No 18\\+ content allowed\\.\n` +
-      `👑 Admin: @cineradarai\\_admin`;
-    try {
-      const sent = await ctx.api.sendMessage(chatId, helpText, { parse_mode: 'MarkdownV2' });
-      await ctx.api.pinChatMessage(chatId, sent.message_id).catch(() => {});
-    } catch (e) {
-      console.error('Bot added welcome/pin error:', e.message);
-    }
+  const n = ctx.update.my_chat_member.new_chat_member.status;
+  const o = ctx.update.my_chat_member.old_chat_member.status;
+  if (n === 'member' && o !== 'member') {
+    ctx.api.sendMessage(ctx.chat.id, 'CineRadar AI is active! Type movie name to search.\n/help for all commands.').then(sent => {
+      ctx.api.pinChatMessage(ctx.chat.id, sent.message_id).catch(() => {});
+    }).catch(() => {});
   }
 });
 
 // ═══════════════════════════════════════
 // 📨 MESSAGE HANDLER
 // ═══════════════════════════════════════
-bot.on('message', async (ctx, next) => {
-  const msg     = ctx.message;
-  const userId  = msg.from.id;
-  const isAdmin = userId === ADMIN_ID;
+bot.on('message', async ctx => {
+  if (!ctx.message || !ctx.from) return;
+  trackUser(ctx);
+  const uid   = ctx.from.id;
+  const admin = isAdmin(ctx);
 
-  trackUser(userId, msg.from.first_name, msg.from.username);
-
-  // FIX #2: Read upload state from map, not session
-  if (isAdmin && (msg.video || msg.document)) {
-    const fileId   = msg.video?.file_id   || msg.document?.file_id;
-    const fileSize = msg.video?.file_size  || msg.document?.file_size || null;
-    adminUploadState.set(userId, { step: 'name', file_id: fileId, size: fileSize });
-    return ctx.reply('✅ File received!\n\n📝 *Step 1/4:* Enter movie name:', { parse_mode: 'Markdown' });
+  // Admin file upload
+  if (admin && (ctx.message.video || ctx.message.document)) {
+    const fileId = ctx.message.video?.file_id || ctx.message.document?.file_id;
+    const size   = ctx.message.video?.file_size || ctx.message.document?.file_size || null;
+    ctx.session.upload = { step: 'name', file_id: fileId, size };
+    return ctx.reply('File received! Step 1/4: Enter movie name:');
   }
 
-  // FIX #2 & #9: Upload wizard uses adminUploadState map; step flow cleaned up
-  const uploadState = isAdmin ? adminUploadState.get(userId) : null;
-  if (uploadState && msg.text) {
-    const text = sanitize(msg.text);
+  // Upload wizard
+  if (admin && ctx.session.upload && ctx.message.text && !ctx.message.text.startsWith('/')) {
+    const state = ctx.session.upload;
+    const text  = clean(ctx.message.text);
     if (!text) return;
-
-    if (uploadState.step === 'name') {
-      uploadState.name = text;
-      uploadState.step = 'year';
-      return ctx.reply('📅 *Step 2/4:* Release year (e.g. 2025):', { parse_mode: 'Markdown' });
+    if (state.step === 'name') {
+      state.name = text; state.step = 'year';
+      return ctx.reply('Step 2/4: Enter release year (e.g. 2024):');
     }
-    if (uploadState.step === 'year') {
-      uploadState.year = text;
-      uploadState.step = 'language';
+    if (state.step === 'year') {
+      if (!/^\d{4}$/.test(text)) return ctx.reply('Enter a valid 4-digit year.');
+      state.year = text; state.step = 'language';
       const kb = new InlineKeyboard()
-        .text('🇮🇳 Hindi',      'ul_lang_Hindi')
-        .text('🇺🇸 English',    'ul_lang_English').row()
-        .text('🎭 Dual Audio',  'ul_lang_Dual Audio')
-        .text('🌍 Multi Audio', 'ul_lang_Multi Audio').row()
-        .text('🎬 Telugu',      'ul_lang_Telugu')
-        .text('🎬 Tamil',       'ul_lang_Tamil').row()
-        .text('🎬 Malayalam',   'ul_lang_Malayalam')
-        .text('🎬 Kannada',     'ul_lang_Kannada');
-      return ctx.reply('🌐 *Step 3/4:* Select language:', { parse_mode: 'Markdown', reply_markup: kb });
+        .text('Hindi',     'ul_Hindi').text('English',  'ul_English').row()
+        .text('Dual Audio','ul_Dual Audio').text('Multi','ul_Multi Audio').row()
+        .text('Telugu',    'ul_Telugu').text('Tamil',   'ul_Tamil').row()
+        .text('Malayalam', 'ul_Malayalam').text('Kannada','ul_Kannada');
+      return ctx.reply('Step 3/4: Select language:', { reply_markup: kb });
     }
-    // Note: step 'quality' is handled via inline button (ul_qual_), text fallback here only
-    if (uploadState.step === 'quality') {
-      uploadState.quality = text;
-      return finishUpload(ctx, uploadState);
+    if (state.step === 'quality') { state.quality = text; return finishUpload(ctx); }
+    return;
+  }
+
+  // Admin edit value input
+  const es = adminEditState[uid];
+  if (admin && es?.step === 'enter_value' && ctx.message.text && !ctx.message.text.startsWith('/')) {
+    const movie = movies[es.movieId];
+    if (!movie) { delete adminEditState[uid]; return; }
+    const val = clean(ctx.message.text);
+    if (!val) return ctx.reply('Cannot be empty.');
+    if (es.field === 'name')  movie.name     = val;
+    if (es.field === 'year')  movie.year     = val;
+    if (es.field === 'lang')  movie.language = val;
+    if (es.field === 'qual')  movie.quality  = val;
+    if (es.field === 'size') {
+      const m = val.match(/^([\d.]+)\s*(MB|GB)$/i);
+      if (!m) return ctx.reply('Format: 1.5 GB or 700 MB');
+      movie.size = Math.round(parseFloat(m[1]) * (m[2].toUpperCase()==='GB' ? 1073741824 : 1048576));
+    }
+    await saveMovies();
+    delete adminEditState[uid];
+    return ctx.reply('Updated: ' + movie.name);
+  }
+
+  // Skip commands and non-text
+  if (!ctx.message.text || ctx.message.text.startsWith('/')) return;
+  if (ctx.message.text.length < 3) {
+    const msg = await ctx.reply('Please type at least 3 characters.');
+    if (!admin) autoDelete(ctx.api, ctx.chat.id, msg.message_id);
+    return;
+  }
+
+  // Force join for search
+  if (!(await enforceJoin(ctx))) return;
+
+  const raw = clean(ctx.message.text);
+  const { movieName, year, language } = parseQuery(raw);
+  const q = movieName.toLowerCase();
+  userLastSearch.set(uid, q);
+  if (users[uid]) { users[uid].search_count = (users[uid].search_count||0)+1; saveUsers(); }
+
+  // ── OMDB lookup ──────────────────────────────────────────────
+  const omdb = await omdbFetch(movieName);
+  if (omdb?.Poster && omdb.Poster !== 'N/A') {
+    let matches = searchDB(movieName);
+    if (year)     matches = matches.filter(m => String(m.year) === year);
+    if (language) matches = matches.filter(m => m.language?.toLowerCase() === language.toLowerCase());
+
+    let cap =
+      '🎬 *' + e(omdb.Title) + '* \\(' + e(omdb.Year) + '\\)\n' +
+      (omdb.Genre!=='N/A'      ? '🎭 ' + e(omdb.Genre) + '\n'               : '') +
+      (omdb.imdbRating!=='N/A' ? '⭐ IMDb: ' + e(omdb.imdbRating) + '/10\n' : '') +
+      (omdb.Director!=='N/A'   ? '🎥 ' + e(omdb.Director) + '\n'            : '') +
+      (omdb.Plot!=='N/A'       ? '\n📖 ' + e(omdb.Plot.slice(0,250)) + '\n'  : '');
+
+    if (matches.length) {
+      cap += '\n✅ *Available — ' + matches.length + ' version\\(s\\)*';
+      const kb = new InlineKeyboard();
+      matches.forEach(m => {
+        kb.text(btnLabel(m), 'send_' + m.id).row();
+        if (admin && adminEditMode) kb.text('Edit: ' + m.name.slice(0,20), 'edit_' + m.id).row();
+      });
+      kb.url('🌐 Website (3x Speed)', WEBSITE_URL).url('📷 Instagram', INSTAGRAM_URL);
+      const fkb  = matches.length > 1 ? filterKB(movieName, matches) : null;
+      const sent = await safePhoto(ctx, omdb.Poster, { caption: cap, parse_mode: 'MarkdownV2', reply_markup: fkb ? mergeKB(kb,fkb) : kb });
+      if (sent && !admin) autoDelete(ctx.api, ctx.chat.id, sent.message_id);
+    } else {
+      cap += '\n❌ *Not available yet* — request below\\!';
+      const kb = new InlineKeyboard()
+        .text('📩 Request', 'request_' + encodeURIComponent(omdb.Title))
+        .row().url('🌐 Website', WEBSITE_URL).url('📷 Instagram', INSTAGRAM_URL);
+      const sent = await safePhoto(ctx, omdb.Poster, { caption: cap, parse_mode: 'MarkdownV2', reply_markup: kb });
+      if (sent && !admin) autoDelete(ctx.api, ctx.chat.id, sent.message_id);
     }
     return;
   }
 
-  // FIX #3: adminEditState keyed by userId
-  const editState = adminEditState[userId];
-  if (editState?.step === 'enter_value' && msg.text) {
-    const movie = movies[editState.movieId];
-    if (!movie) { delete adminEditState[userId]; return; }
-    const val = sanitize(msg.text);
-    if (!val) return ctx.reply('❌ Cannot be empty.');
-    if (editState.field === 'name') movie.name     = val;
-    if (editState.field === 'year') movie.year     = val;
-    if (editState.field === 'lang') movie.language = val;
-    if (editState.field === 'qual') movie.quality  = val;
-    if (editState.field === 'size') {
-      const m = val.match(/^([\d.]+)\s*(MB|GB)$/i);
-      if (!m) return ctx.reply('❌ Format: 1.5 GB or 700 MB');
-      const n = parseFloat(m[1]);
-      movie.size = Math.round(m[2].toUpperCase() === 'GB' ? n * 1024 * 1024 * 1024 : n * 1024 * 1024);
-    }
-    await saveDB();
-    delete adminEditState[userId];
-    return ctx.reply(`✅ Updated: *${escapeMarkdown(movie.name)}*`, { parse_mode: 'Markdown' });
-  }
-
-  if (!msg.text || msg.text.startsWith('/')) return next();
-  if (msg.text.length < 3) return tempReply(ctx, '⚠️ Please enter at least 3 characters.');
-
-  const rawQuery = sanitize(msg.text);
-  const { movieName: parsedName, year: parsedYear, language: parsedLang } = parseQuery(rawQuery);
-
-  const query = parsedName.toLowerCase();
-  userLastSearch.set(userId, query);
-
-  if (users[userId]) {
-    users[userId].search_count = (users[userId].search_count || 0) + 1;
-    saveUsers();
-  }
-
-  const omdb = await fetchOMDb(parsedName);
-
-  if (omdb && omdb.Poster && omdb.Poster !== 'N/A') {
-    let caption = `🎬 *${escapeMarkdown(omdb.Title)}* (${omdb.Year})\n`;
-    if (omdb.Genre      !== 'N/A') caption += `🎭 ${escapeMarkdown(omdb.Genre)}\n`;
-    if (omdb.imdbRating !== 'N/A') caption += `⭐ IMDb: ${omdb.imdbRating}/10\n`;
-    if (omdb.Director   !== 'N/A') caption += `🎥 ${escapeMarkdown(omdb.Director)}\n`;
-    if (omdb.Plot       !== 'N/A') caption += `\n📖 ${escapeMarkdown(omdb.Plot)}\n`;
-
-    let matches = searchMovies(parsedName);
-    if (parsedYear) matches = matches.filter(m => String(m.year) === parsedYear);
-    if (parsedLang) matches = matches.filter(m => (m.language || '').toLowerCase() === parsedLang.toLowerCase());
-
-    if (matches.length > 0) {
-      caption += `\n✅ *Available — ${matches.length} version(s)*`;
-      caption += `\n\n💡 *Visit our website for 3x faster downloads!*`;
-
-      const kb = new InlineKeyboard();
-      matches.forEach(m => {
-        kb.text(movieBtnLabel(m), `send_${m.id}`).row();
-        if (isAdmin && adminEditMode[userId]) {
-          kb.text(`✏️ Edit "${m.name.slice(0, 20)}"`, `edit_${m.id}`).row();
-        }
-      });
-      kb.url('🌐 Visit Website (3x dowload Speed)', WEBSITE_URL).row();
-      kb.url('📷 Follow on Instagram', INSTAGRAM_URL);
-
-      if (matches.length > 1) {
-        const fkb = buildFilterKeyboard(parsedName, matches);
-        return tempPhoto(ctx, omdb.Poster, { caption, parse_mode: 'Markdown', reply_markup: mergeKeyboards(kb, fkb) });
-      }
-      return tempPhoto(ctx, omdb.Poster, { caption, parse_mode: 'Markdown', reply_markup: kb });
-    } else {
-      caption += `\n❌ *Not available yet.*\n📩 Request below — admin will upload!\n\n💡 *Visit our website for updates!*`;
-      const kb = new InlineKeyboard()
-        .text('📩 Request', `request_${encodeURIComponent(omdb.Title)}`)
-        .url('🌐 Visit Website', WEBSITE_URL)
-        .row()
-        .url('📷 Instagram', INSTAGRAM_URL);
-      return tempPhoto(ctx, omdb.Poster, { caption, parse_mode: 'Markdown', reply_markup: kb });
-    }
-  }
-
-  let results = searchMovies(parsedName);
-  if (parsedYear) results = results.filter(m => String(m.year) === parsedYear);
-  if (parsedLang) results = results.filter(m => (m.language || '').toLowerCase() === parsedLang.toLowerCase());
-
-  if (results.length > 0) {
-    let txt = `🎬 *Found ${results.length} result(s) for "${escapeMarkdown(sanitize(msg.text))}"*\n\n`;
-    const grouped = groupMovies(results);
-    grouped.forEach(g => { txt += `• *${escapeMarkdown(g.displayName)}* ${g.year || ''}\n`; });
-    txt += `\n🔽 *Tap to download:*\n\n💡 *Visit our website for 3x faster downloads!*`;
-
+  // ── Local DB ─────────────────────────────────────────────────
+  let results = searchDB(movieName);
+  if (year)     results = results.filter(m => String(m.year) === year);
+  if (language) results = results.filter(m => m.language?.toLowerCase() === language.toLowerCase());
+  if (results.length) {
+    let txt = '🎬 *Found ' + results.length + ' result\\(s\\) for "' + e(raw) + '"*\n\n';
+    results.forEach(m => { txt += '• *' + e(m.name) + '* \\(' + e(m.year||'?') + '\\)\n'; });
+    txt += '\n⬇️ *Tap to download:*';
     const kb = new InlineKeyboard();
     results.forEach(m => {
-      kb.text(movieBtnLabel(m), `send_${m.id}`).row();
-      if (isAdmin && adminEditMode[userId]) {
-        kb.text(`✏️ Edit`, `edit_${m.id}`).row();
-      }
+      kb.text(btnLabel(m), 'send_' + m.id).row();
+      if (admin && adminEditMode) kb.text('Edit', 'edit_' + m.id).row();
     });
-    kb.url('🌐 Visit Website (3x download Speed)', WEBSITE_URL).row();
-    kb.url('📷 Follow on Instagram', INSTAGRAM_URL);
-
-    if (results.length > 1) {
-      const fkb = buildFilterKeyboard(parsedName, results);
-      return tempReply(ctx, txt, { parse_mode: 'Markdown', reply_markup: mergeKeyboards(kb, fkb) });
-    }
-    return tempReply(ctx, txt, { parse_mode: 'Markdown', reply_markup: kb });
+    kb.url('🌐 Website (3x Speed)', WEBSITE_URL).url('📷 Instagram', INSTAGRAM_URL);
+    const fkb  = results.length > 1 ? filterKB(movieName, results) : null;
+    const sent = await safeReply(ctx, txt, { parse_mode: 'MarkdownV2', reply_markup: fkb ? mergeKB(kb,fkb) : kb });
+    if (sent && !admin) autoDelete(ctx.api, ctx.chat.id, sent.message_id);
+    return;
   }
 
-  const suggestion = fuzzyMatch(parsedName);
-  if (suggestion) {
-    let sugResults = searchMovies(suggestion);
-    if (parsedYear) sugResults = sugResults.filter(m => String(m.year) === parsedYear);
-    if (parsedLang) sugResults = sugResults.filter(m => (m.language || '').toLowerCase() === parsedLang.toLowerCase());
-
-    if (sugResults.length) {
+  // ── Fuzzy ────────────────────────────────────────────────────
+  const sug = fuzzySearch(movieName);
+  if (sug) {
+    const sugRes = searchDB(sug);
+    if (sugRes.length) {
       const kb = new InlineKeyboard();
-      sugResults.forEach(m => kb.text(movieBtnLabel(m), `send_${m.id}`).row());
-      kb.url('🌐 Visit Website (3x download Speed)', WEBSITE_URL).row();
-      kb.url('📷 Instagram', INSTAGRAM_URL);
-      return tempReply(ctx,
-        `❓ *"${escapeMarkdown(sanitize(msg.text))}"* not found.\n\nDid you mean *${escapeMarkdown(suggestion)}*?\n\n💡 *Visit website for 3x speed!*`,
-        { parse_mode: 'Markdown', reply_markup: kb });
+      sugRes.forEach(m => kb.text(btnLabel(m), 'send_' + m.id).row());
+      kb.url('🌐 Website', WEBSITE_URL).url('📷 Instagram', INSTAGRAM_URL);
+      const sent = await safeReply(ctx, '"' + raw + '" not found. Did you mean *' + e(sug) + '*?', { parse_mode: 'MarkdownV2', reply_markup: kb });
+      if (sent && !admin) autoDelete(ctx.api, ctx.chat.id, sent.message_id);
+      return;
     }
   }
 
-  const omdbFallback = await fetchOMDb(parsedName);
-  if (omdbFallback && omdbFallback.Poster && omdbFallback.Poster !== 'N/A') {
-    let caption = `🎬 *${escapeMarkdown(omdbFallback.Title)}* (${omdbFallback.Year})\n`;
-    if (omdbFallback.Plot !== 'N/A') caption += `\n📖 ${escapeMarkdown(omdbFallback.Plot)}\n`;
-    caption += `\n❌ *Not in our database yet.*\n📩 Request below!\n\n💡 *Visit our website for updates!*`;
-    const kb = new InlineKeyboard()
-      .text('📩 Request', `request_${encodeURIComponent(omdbFallback.Title)}`)
-      .url('🌐 Visit Website', WEBSITE_URL)
-      .row()
-      .url('📷 Instagram', INSTAGRAM_URL);
-    return tempPhoto(ctx, omdbFallback.Poster, { caption, parse_mode: 'Markdown', reply_markup: kb });
-  }
-
+  // ── Not found ────────────────────────────────────────────────
   const kb = new InlineKeyboard()
-    .text('📩 Request Movie', `request_${encodeURIComponent(parsedName)}`)
-    .url('🌐 Visit Website', WEBSITE_URL)
-    .row()
-    .url('📷 Instagram', INSTAGRAM_URL);
-  return tempReply(ctx,
-    `❌ *"${escapeMarkdown(sanitize(msg.text))}"* not found.\n\nRequest it below!\n\n💡 *Visit our website daily for 3x download speed!*`,
-    { parse_mode: 'Markdown', reply_markup: kb });
+    .text('📩 Request Movie', 'request_' + encodeURIComponent(movieName))
+    .row().url('🌐 Website', WEBSITE_URL).url('📷 Instagram', INSTAGRAM_URL);
+  const sent = await safeReply(ctx, '"' + raw + '" not found. Request it below!', { reply_markup: kb });
+  if (sent && !admin) autoDelete(ctx.api, ctx.chat.id, sent.message_id);
 });
 
 // ═══════════════════════════════════════
-// 🔘 CALLBACK HANDLER
+// 📤 FINISH UPLOAD
+// ═══════════════════════════════════════
+async function finishUpload(ctx) {
+  const state = ctx.session.upload;
+  if (!state) return;
+  const key = 'm_' + movieCounter;
+  movies[key] = {
+    id: key, shortId: movieCounter,
+    file_id: state.file_id, name: state.name, year: state.year,
+    language: state.language, quality: state.quality,
+    size: state.size || null, downloads: 0, added: new Date().toISOString()
+  };
+  movieCounter++;
+  await saveMovies();
+  ctx.session.upload = null;
+
+  const kb = new InlineKeyboard()
+    .text('📢 Post to Channel', 'post_channel_' + key)
+    .text('🔒 Post to Backup',  'post_backup_'  + key)
+    .row()
+    .text('Skip', 'dismiss');
+
+  ctx.reply(
+    'Movie Saved!\n\n' + state.name + ' (' + state.year + ')\n' +
+    state.language + ' | ' + state.quality + (state.size ? ' | ' + fmtSize(state.size) : '') +
+    '\nID: ' + key,
+    { reply_markup: kb }
+  );
+}
+
+// ═══════════════════════════════════════
+// 🔘 CALLBACKS
 // ═══════════════════════════════════════
 bot.on('callback_query:data', async ctx => {
-  const data   = ctx.callbackQuery.data;
-  const userId = ctx.from.id;
-  const chatId = ctx.callbackQuery.message?.chat?.id;
+  const data  = ctx.callbackQuery.data;
+  const uid   = ctx.from.id;
+  const admin = uid === ADMIN_ID;
 
-  // ── Website visit confirmation ────────────────────────────
+  // check_join
+  if (data === 'check_join') {
+    const ok = await checkMember(ctx.api, uid);
+    if (ok) {
+      await ctx.answerCallbackQuery({ text: 'Access granted! Welcome!' });
+      ctx.deleteMessage().catch(() => {});
+      ctx.reply('You now have full access. Type a movie name to search!');
+    } else {
+      await ctx.answerCallbackQuery({ text: 'Please join both the channel and backup group first!', show_alert: true });
+    }
+    return;
+  }
+
+  // visit_done
   if (data === 'visit_done') {
-    markWebsiteVisited(userId);
-    await ctx.answerCallbackQuery({ text: '✅ Website visit confirmed! You now have 3x speed for today!' });
-    try { await ctx.deleteMessage(); } catch {}
+    markVisited(uid);
+    await ctx.answerCallbackQuery({ text: '3x speed enabled for today!' });
+    ctx.deleteMessage().catch(() => {});
     return;
   }
 
-  // ── Retry download after visiting website ─────────────────
-  if (data.startsWith('retry_dl_')) {
-    const movieId = data.slice('retry_dl_'.length);
-    const m = movies[movieId];
-    if (!m) return ctx.answerCallbackQuery({ text: '❌ Movie not found', show_alert: true });
-
-    if (!hasVisitedWebsiteToday(userId)) {
-      return ctx.answerCallbackQuery({ text: '⚠️ Please visit the website first!', show_alert: true });
-    }
-
-    m.downloads = (m.downloads || 0) + 1;
-    if (users[userId]) users[userId].downloads = (users[userId].downloads || 0) + 1;
-    saveDB(); saveUsers();
-
-    const caption =
-      `🎬 *${escapeMarkdown(m.name)}* (${m.year || '?'})\n` +
-      `🌐 ${m.language || 'N/A'} | 📺 ${m.quality || 'N/A'}${m.size ? ' | ' + fmtSize(m.size) : ''}\n\n` +
-      `⚡ *Fast Download (3x speed) enabled for today!*\n` +
-      `⏱️ *Auto-deletes in 3 minutes - forward and save.*`;
-
+  // Upload: language
+  if (data.startsWith('ul_')) {
+    if (!admin) return ctx.answerCallbackQuery({ text: 'Admin only' });
+    if (!ctx.session.upload) return ctx.answerCallbackQuery({ text: 'No upload session' });
+    ctx.session.upload.language = data.slice(3);
+    ctx.session.upload.step     = 'quality';
+    await ctx.answerCallbackQuery({ text: 'Language: ' + ctx.session.upload.language });
     const kb = new InlineKeyboard()
-      .url('🌐 Visit Website (3x download Speed)', WEBSITE_URL)
-      .row()
-      .url('📷 Follow on Instagram', INSTAGRAM_URL);
-
-    try {
-      const sent = await ctx.reply('', { reply_markup: kb });
-      await bot.api.sendVideo(chatId, m.file_id, { caption, parse_mode: 'Markdown', reply_markup: kb });
-      // FIX #10: use bot.api + chatId for delete scheduling
-      if (userId !== ADMIN_ID && chatId) {
-        scheduleDelete(chatId, sent.message_id);
-      }
-      await ctx.answerCallbackQuery({ text: `📥 ${m.name} - 3x Speed Active!` });
-      try { await ctx.deleteMessage(); } catch {}
-    } catch (e) {
-      console.error('retry_dl error:', e.message);
-      await ctx.answerCallbackQuery({ text: '❌ Error sending file.', show_alert: true });
-    }
-    return;
+      .text('360p','uq_360p').text('480p','uq_480p').row()
+      .text('720p','uq_720p').text('1080p','uq_1080p').row()
+      .text('4K','uq_4K').text('HDR','uq_HDR');
+    return ctx.reply('Step 4/4: Select quality:', { reply_markup: kb });
   }
 
-  // ── Language selection during upload ─────────────────────
-  if (data.startsWith('ul_lang_')) {
-    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
-    // FIX #2: use adminUploadState map
-    const state = adminUploadState.get(userId);
-    if (!state) return ctx.answerCallbackQuery({ text: '❌ No active upload session', show_alert: true });
-    const lang = data.slice('ul_lang_'.length);
-    state.language = lang;
-    state.step = 'quality';
-    await ctx.answerCallbackQuery({ text: `Language: ${lang}` });
-    const kb = new InlineKeyboard()
-      .text('360p', 'ul_qual_360p').text('480p', 'ul_qual_480p').row()
-      .text('720p', 'ul_qual_720p').text('1080p', 'ul_qual_1080p').row()
-      .text('4K UHD', 'ul_qual_4K').text('HDR', 'ul_qual_HDR');
-    return ctx.reply('📺 *Step 4/4:* Select quality:', { parse_mode: 'Markdown', reply_markup: kb });
+  // Upload: quality
+  if (data.startsWith('uq_')) {
+    if (!admin) return ctx.answerCallbackQuery({ text: 'Admin only' });
+    if (!ctx.session.upload) return ctx.answerCallbackQuery({ text: 'No upload session' });
+    ctx.session.upload.quality = data.slice(3);
+    await ctx.answerCallbackQuery({ text: 'Quality: ' + ctx.session.upload.quality });
+    return finishUpload(ctx);
   }
 
-  // ── Quality selection during upload ──────────────────────
-  if (data.startsWith('ul_qual_')) {
-    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
-    // FIX #2: use adminUploadState map
-    const state = adminUploadState.get(userId);
-    if (!state) return ctx.answerCallbackQuery({ text: '❌ No active upload session', show_alert: true });
-    state.quality = data.slice('ul_qual_'.length);
-    await ctx.answerCallbackQuery({ text: `Quality: ${state.quality}` });
-    return finishUpload(ctx, state);
-  }
-
-  // ── Send movie to user ────────────────────────────────────
+  // send_
   if (data.startsWith('send_')) {
-    const movieId = data.slice('send_'.length);
-    const m = movies[movieId];
-    if (!m) return ctx.answerCallbackQuery({ text: '❌ Movie not found', show_alert: true });
-
-    if (!hasVisitedWebsiteToday(userId)) {
-      const promptKb = new InlineKeyboard()
+    const m = movies[data.slice(5)];
+    if (!m) return ctx.answerCallbackQuery({ text: 'Movie not found', show_alert: true });
+    if (!hasVisitedToday(uid)) {
+      const kb = new InlineKeyboard()
         .url('🌐 Visit Website', WEBSITE_URL)
-        .text("✅ I've Visited", 'visit_done')
         .row()
-        .text('⬇️ Download Now', `retry_dl_${movieId}`);
-
-      // FIX #4: ctx.reply works in callback context (replies to the callback message's chat)
-      const promptMsg = await ctx.reply(
-        `🌐 *Unlock 3x Faster Download!*\n\n` +
-        `Visit our website once today to enable fast download speed for all movies.\n\n` +
-        `1️⃣ Click "Visit Website" below\n` +
-        `2️⃣ Browse for a few seconds\n` +
-        `3️⃣ Come back and click "✅ I've Visited"`,
-        { parse_mode: 'Markdown', reply_markup: promptKb }
-      );
-      if (userId !== ADMIN_ID && chatId) {
-        scheduleDelete(chatId, promptMsg.message_id);
-      }
-      return ctx.answerCallbackQuery({ text: '🌐 Visit website first for 3x speed!' });
+        .text("I've Visited", 'visit_done')
+        .text('Download Anyway', 'dl_' + data.slice(5));
+      const pm = await ctx.reply('Visit our website for 3x download speed!\n\n1. Visit Website\n2. Come back\n3. Tap "I\'ve Visited"', { reply_markup: kb });
+      if (!admin) autoDelete(ctx.api, ctx.chat.id, pm.message_id);
+      return ctx.answerCallbackQuery({ text: 'Visit website for 3x speed!' });
     }
-
-    m.downloads = (m.downloads || 0) + 1;
-    if (users[userId]) users[userId].downloads = (users[userId].downloads || 0) + 1;
-    saveDB(); saveUsers();
-
-    const caption =
-      `🎬 *${escapeMarkdown(m.name)}* (${m.year || '?'})\n` +
-      `🌐 ${m.language || 'N/A'} | 📺 ${m.quality || 'N/A'}${m.size ? ' | ' + fmtSize(m.size) : ''}\n\n` +
-      `⚡ *Fast Download (3x speed) enabled for today!*\n` +
-      `⏱️ *Auto-deletes in 3 minutes - forward and save.*`;
-
-    const kb = new InlineKeyboard()
-      .url('🌐 Visit Website (3x download Speed)', WEBSITE_URL)
-      .row()
-      .url('📷 Follow on Instagram', INSTAGRAM_URL);
-
-    try {
-      const sent = await ctx.replyWithVideo(m.file_id, { caption, parse_mode: 'Markdown', reply_markup: kb });
-      if (userId !== ADMIN_ID && chatId) {
-        scheduleDelete(chatId, sent.message_id);
-      }
-      return ctx.answerCallbackQuery({ text: `📥 ${m.name} - 3x Speed Active!` });
-    } catch (e) {
-      console.error('send_ error:', e.message);
-      return ctx.answerCallbackQuery({ text: '❌ Error sending file.', show_alert: true });
-    }
+    return deliverMovie(ctx, m);
   }
 
-  // ── Filter buttons ────────────────────────────────────────
+  // dl_ (direct)
+  if (data.startsWith('dl_')) {
+    const m = movies[data.slice(3)];
+    if (!m) return ctx.answerCallbackQuery({ text: 'Movie not found', show_alert: true });
+    return deliverMovie(ctx, m);
+  }
+
+  // filter
   if (data.startsWith('f|')) {
     const parts = data.split('|');
     if (parts.length < 4) return ctx.answerCallbackQuery();
-    const [, shortQ, type, val] = parts;
-    const fullQuery = userLastSearch.get(userId) || shortQ;
-
-    let filters = {};
-    if (type === 'lang') filters.language = val;
-    if (type === 'qual') filters.quality  = val;
-    if (type === 'year') filters.year     = val;
-
-    const results = type === 'all' ? searchMovies(fullQuery) : searchMovies(fullQuery, filters);
+    const [, q, type, val] = parts;
+    const fullQ   = userLastSearch.get(uid) || q;
+    const filters = type==='lang'?{language:val}:type==='qual'?{quality:val}:type==='year'?{year:val}:{};
+    const results = type==='all' ? searchDB(fullQ) : searchDB(fullQ, filters);
     if (!results.length) return ctx.answerCallbackQuery({ text: 'No results', show_alert: true });
-
     const kb = new InlineKeyboard();
-    results.forEach(m => {
-      kb.text(movieBtnLabel(m), `send_${m.id}`).row();
-      if (userId === ADMIN_ID && adminEditMode[userId]) {
-        kb.text(`✏️ Edit`, `edit_${m.id}`).row();
-      }
-    });
-    kb.url('🌐 Visit Website (3x download Speed)', WEBSITE_URL).row();
-    kb.url('📷 Instagram', INSTAGRAM_URL);
-
-    const fkb = buildFilterKeyboard(fullQuery, results);
-    const merged = mergeKeyboards(kb, fkb);
-    try { await ctx.editMessageReplyMarkup({ reply_markup: merged }); } catch {}
-    return ctx.answerCallbackQuery({ text: `${results.length} result(s)` });
+    results.forEach(m => kb.text(btnLabel(m), 'send_' + m.id).row());
+    kb.url('🌐 Website', WEBSITE_URL).url('📷 Instagram', INSTAGRAM_URL);
+    const fkb = filterKB(fullQ, results);
+    ctx.editMessageReplyMarkup({ reply_markup: mergeKB(kb, fkb) }).catch(() => {});
+    return ctx.answerCallbackQuery({ text: results.length + ' result(s)' });
   }
 
-  // ── Movie request ─────────────────────────────────────────
+  // request_
   if (data.startsWith('request_')) {
-    const movieName = decodeURIComponent(data.slice('request_'.length));
-    const already = requests.find(r =>
-      r.user === userId &&
-      r.movie.toLowerCase() === movieName.toLowerCase() &&
-      (!r.status || r.status === 'Pending')
-    );
-    if (already) return ctx.answerCallbackQuery({ text: '⚠️ Already requested!', show_alert: true });
-
-    requests.push({ user: userId, movie: movieName, time: new Date().toISOString(), status: 'Pending' });
+    const name = decodeURIComponent(data.slice(8));
+    const dup  = requests.find(r => r.user===uid && r.movie.toLowerCase()===name.toLowerCase() && (!r.status||r.status==='Pending'));
+    if (dup) return ctx.answerCallbackQuery({ text: 'Already requested!', show_alert: true });
+    requests.push({ user: uid, movie: name, time: new Date().toISOString(), status: 'Pending' });
     await saveRequests();
-    await tempReply(ctx, `✅ *Request sent for "${escapeMarkdown(movieName)}"!*\n\nUse /myrequests to track.`, { parse_mode: 'Markdown' });
-    try {
-      await bot.api.sendMessage(ADMIN_ID,
-        `📩 *New Request*\n\n🎬 ${escapeMarkdown(movieName)}\n👤 User: ${userId}`,
-        { parse_mode: 'Markdown' });
-    } catch {}
-    return ctx.answerCallbackQuery({ text: '✅ Request sent!' });
+    const msg = await ctx.reply('Request sent for "' + name + '"! Use /myrequests to track.');
+    if (!admin) autoDelete(ctx.api, ctx.chat.id, msg.message_id);
+    ctx.api.sendMessage(ADMIN_ID,
+      'New Request\n\nMovie: ' + name + '\nUser: ' + (ctx.from.first_name||'') + ' (ID: ' + uid + ')'
+    ).catch(() => {});
+    return ctx.answerCallbackQuery({ text: 'Request sent!' });
   }
 
-  // ── Edit movie (admin) ────────────────────────────────────
+  // edit_
   if (data.startsWith('edit_')) {
-    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
-    const mid = data.slice('edit_'.length);
-    const m = movies[mid];
-    if (!m) return ctx.answerCallbackQuery({ text: '❌ Not found' });
-    // FIX #3: key by userId
-    adminEditState[userId] = { movieId: mid, step: 'choose_field' };
+    if (!admin) return ctx.answerCallbackQuery({ text: 'Admin only' });
+    const mid = data.slice(5);
+    const m   = movies[mid];
+    if (!m) return ctx.answerCallbackQuery({ text: 'Not found' });
+    adminEditState[uid] = { movieId: mid, step: 'choose_field' };
     const kb = new InlineKeyboard()
-      .text('📝 Name',     'ef_name').text('📅 Year',    'ef_year').row()
-      .text('🌐 Language', 'ef_lang').text('📺 Quality', 'ef_qual').row()
-      .text('💾 Size',     'ef_size').text('❌ Cancel',  'ef_cancel');
-    await ctx.reply(`✏️ Editing: *${escapeMarkdown(m.name)}*\nChoose field:`, { parse_mode: 'Markdown', reply_markup: kb });
+      .text('Name','ef_name').text('Year','ef_year').row()
+      .text('Language','ef_lang').text('Quality','ef_qual').row()
+      .text('Size','ef_size').text('Cancel','ef_cancel');
+    await ctx.reply('Editing: ' + m.name + '\nChoose field:', { reply_markup: kb });
     return ctx.answerCallbackQuery();
   }
 
   if (data.startsWith('ef_')) {
-    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
-    const field = data.slice('ef_'.length);
-    if (field === 'cancel') {
-      // FIX #3: key by userId
-      delete adminEditState[userId];
-      await ctx.reply('❌ Cancelled.');
-      return ctx.answerCallbackQuery();
-    }
-    // FIX #3: key by userId
-    adminEditState[userId].field = field;
-    adminEditState[userId].step  = 'enter_value';
-    const prompts = {
-      name: '📝 Enter new name:',
-      year: '📅 Enter new year:',
-      lang: '🌐 Enter new language:',
-      qual: '📺 Enter quality (e.g. 1080p):',
-      size: '💾 Enter size (e.g. 1.5 GB or 700 MB):'
-    };
+    if (!admin) return ctx.answerCallbackQuery({ text: 'Admin only' });
+    const field = data.slice(3);
+    if (field === 'cancel') { delete adminEditState[uid]; await ctx.reply('Cancelled.'); return ctx.answerCallbackQuery(); }
+    adminEditState[uid].field = field;
+    adminEditState[uid].step  = 'enter_value';
+    const prompts = { name:'Enter new name:', year:'Enter new year:', lang:'Enter new language:', qual:'Enter quality (e.g. 1080p):', size:'Enter size (e.g. 1.5 GB or 700 MB):' };
     await ctx.reply(prompts[field] || 'Enter value:');
     return ctx.answerCallbackQuery();
   }
 
-  // ── Mark request fulfilled (admin) ────────────────────────
+  // req_done_
   if (data.startsWith('req_done_')) {
-    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
-    const rest   = data.slice('req_done_'.length);
-    const uIdx   = rest.indexOf('_');
-    const reqUser   = rest.slice(0, uIdx);
-    const movieName = decodeURIComponent(rest.slice(uIdx + 1));
-    const req = requests.find(r => String(r.user) === String(reqUser) && r.movie === movieName);
-    if (req) { req.status = 'Fulfilled'; await saveRequests(); }
-    return ctx.answerCallbackQuery({ text: '✅ Marked fulfilled' });
+    if (!admin) return ctx.answerCallbackQuery({ text: 'Admin only' });
+    const rest    = data.slice(9);
+    const idx     = rest.indexOf('_');
+    const reqUser = rest.slice(0, idx);
+    const name    = decodeURIComponent(rest.slice(idx + 1));
+    const req     = requests.find(r => String(r.user)===reqUser && r.movie===name);
+    if (req) {
+      req.status = 'Fulfilled';
+      await saveRequests();
+      ctx.api.sendMessage(Number(reqUser), 'Your request for "' + name + '" has been fulfilled! Search for it in the bot now.').catch(() => {});
+    }
+    return ctx.answerCallbackQuery({ text: 'Marked fulfilled + user notified!' });
   }
 
-  // ── Post to channel (admin) ───────────────────────────────
-  if (data.startsWith('post_to_channel_')) {
-    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
-    const movieId = data.slice('post_to_channel_'.length);
-    const m = movies[movieId];
-    if (!m) return ctx.answerCallbackQuery({ text: '❌ Movie not found' });
-
+  // post_channel_
+  if (data.startsWith('post_channel_')) {
+    if (!admin) return ctx.answerCallbackQuery({ text: 'Admin only' });
+    const m = movies[data.slice(13)];
+    if (!m) return ctx.answerCallbackQuery({ text: 'Not found' });
     try {
-      await bot.api.sendVideo(CHANNEL, m.file_id, {
-        caption:
-          `🎬 *New Movie Added!*\n\n` +
-          `${escapeMarkdown(m.name)} (${m.year || '?'})\n` +
-          `🌐 ${m.language || 'N/A'} | 📺 ${m.quality || 'N/A'}${m.size ? ' | ' + fmtSize(m.size) : ''}\n\n` +
-          `📥 Use the bot to download!\n` +
-          `💡 *Visit ${WEBSITE_URL} for 3x download speed!*`,
-        parse_mode: 'Markdown'
+      await ctx.api.sendVideo(CHANNEL, m.file_id, {
+        caption: 'New Movie!\n\n' + m.name + ' (' + (m.year||'?') + ')\n' + (m.language||'N/A') + ' | ' + (m.quality||'N/A') + (m.size?' | '+fmtSize(m.size):'') + '\n\nSearch in bot to download!'
       });
-      // FIX #8: use a valid empty keyboard instead of undefined
-      await ctx.editMessageReplyMarkup({ reply_markup: new InlineKeyboard().text('✅ Posted to Channel', 'noop') });
-      return ctx.answerCallbackQuery({ text: '✅ Posted to channel!' });
-    } catch (e) {
-      console.error('post_to_channel error:', e.message);
-      return ctx.answerCallbackQuery({ text: '❌ Failed to post.', show_alert: true });
+      ctx.editMessageReplyMarkup({ reply_markup: new InlineKeyboard().text('Posted to Channel', 'done') }).catch(() => {});
+      return ctx.answerCallbackQuery({ text: 'Posted to channel!' });
+    } catch (err) {
+      console.error('[POST CH]', err.message);
+      return ctx.answerCallbackQuery({ text: 'Failed: ' + err.message, show_alert: true });
     }
   }
 
-  if (data === 'dismiss_post' || data === 'noop' || data === 'done') {
-    try { await ctx.editMessageReplyMarkup({ reply_markup: new InlineKeyboard() }); } catch {}
+  // post_backup_
+  if (data.startsWith('post_backup_')) {
+    if (!admin) return ctx.answerCallbackQuery({ text: 'Admin only' });
+    const m = movies[data.slice(12)];
+    if (!m) return ctx.answerCallbackQuery({ text: 'Not found' });
+    try {
+      await ctx.api.sendVideo(BACKUP_GROUP, m.file_id, {
+        caption: 'BACKUP\n\n' + m.name + ' (' + (m.year||'?') + ')\n' + (m.language||'N/A') + ' | ' + (m.quality||'N/A') + (m.size?' | '+fmtSize(m.size):'') + '\nID: ' + m.id
+      });
+      ctx.editMessageReplyMarkup({ reply_markup: new InlineKeyboard().text('Posted to Backup', 'done') }).catch(() => {});
+      return ctx.answerCallbackQuery({ text: 'Posted to backup group!' });
+    } catch (err) {
+      console.error('[POST BK]', err.message);
+      return ctx.answerCallbackQuery({ text: 'Failed: ' + err.message, show_alert: true });
+    }
+  }
+
+  if (data === 'dismiss' || data === 'done') {
+    ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
     return ctx.answerCallbackQuery();
   }
 
@@ -1236,121 +1001,83 @@ bot.on('callback_query:data', async ctx => {
 });
 
 // ═══════════════════════════════════════
-// 📅 DAILY AUTO POST
+// 📅 DAILY POST
 // ═══════════════════════════════════════
-const DAILY_FILE = 'lastDailySent.json';
-async function sendDailySuggestions() {
+async function dailyPost() {
   try {
-    let lastDate = '';
-    try { lastDate = (await fs.readFile(DAILY_FILE, 'utf8')).trim(); } catch {}
-    const today = new Date().toISOString().slice(0, 10);
+    const today = new Date().toISOString().slice(0,10);
+    let last = '';
+    try { last = (await fs.readFile('lastDaily.txt','utf8')).trim(); } catch {}
+    if (last === today) { console.log('[DAILY] Already posted today'); return; }
+    console.log('[DAILY] Posting...');
 
-    if (lastDate === today) {
-      console.log('[DAILY] Already sent today.');
-      return;
-    }
-
-    console.log('[DAILY] Sending daily post...');
-
-    const todayQueue = dailyQueue.find(entry => entry.date === today);
-    let newMoviesList      = [];
-    let upcomingMoviesList = [];
-
-    if (todayQueue && todayQueue.items.length > 0) {
-      console.log('[DAILY] Using admin queue for today.');
-      newMoviesList      = todayQueue.items.filter(i => i.type === 'new').map(i => i.movieData);
-      upcomingMoviesList = todayQueue.items.filter(i => i.type === 'upcoming').map(i => i.movieData);
+    const todayQ = dailyQueue.find(e => e.date === today);
+    let newList = [], upList = [];
+    if (todayQ?.items?.length) {
+      newList = todayQ.items.filter(i=>i.type==='new').map(i=>i.movieData);
+      upList  = todayQ.items.filter(i=>i.type==='upcoming').map(i=>i.movieData);
     } else {
-      console.log('[DAILY] No queue found, fetching automatically...');
-      try { newMoviesList      = await getIndianMoviesByType('new', 3);      } catch (e) { console.error('[DAILY] New fetch error:', e); }
-      try { upcomingMoviesList = await getIndianMoviesByType('upcoming', 2); } catch (e) { console.error('[DAILY] Upcoming fetch error:', e); }
+      try { newList = await fetchIndian('new',3); } catch {}
+      try { upList  = await fetchIndian('upcoming',2); } catch {}
     }
 
-    // FIX #7: OMDb data always uses 'Poster' key — consistent access
-    for (const m of newMoviesList) {
-      if (!m.Poster || m.Poster === 'N/A') continue;
-      await bot.api.sendPhoto(CHANNEL, m.Poster, {
-        caption:
-          `🆕 *New Indian Release!*\n\n` +
-          `🎬 ${escapeMarkdown(m.Title)} (${m.Year})\n` +
-          `⭐ IMDb: ${m.imdbRating || 'N/A'}\n` +
-          `📖 ${escapeMarkdown(m.Plot || '')}\n\n` +
-          `📥 Search on bot to request!\n` +
-          `💡 *Visit ${WEBSITE_URL} for 3x download speed!*`,
-        parse_mode: 'Markdown'
-      }).catch(e => console.error('[DAILY] sendPhoto new error:', e.message));
-      await new Promise(r => setTimeout(r, 1000));
+    for (const m of newList) {
+      try {
+        await bot.api.sendPhoto(CHANNEL, m.Poster, { caption: 'NEW: ' + m.Title + ' (' + m.Year + ')\nIMDb: ' + (m.imdbRating||'N/A') + '\n' + (m.Plot||'').slice(0,200) + '\n\nSearch in bot to request!' });
+        await delay(1000);
+      } catch {}
+    }
+    for (const m of upList) {
+      try {
+        await bot.api.sendPhoto(CHANNEL, m.Poster, { caption: 'UPCOMING: ' + m.Title + ' (' + m.Year + ')\nIMDb: ' + (m.imdbRating||'N/A') + '\n' + (m.Plot||'').slice(0,200) + '\n\nSearch in bot to request!' });
+        await delay(1000);
+      } catch {}
     }
 
-    for (const m of upcomingMoviesList) {
-      if (!m.Poster || m.Poster === 'N/A') continue;
-      await bot.api.sendPhoto(CHANNEL, m.Poster, {
-        caption:
-          `🔮 *Upcoming Indian Movie!*\n\n` +
-          `🎬 ${escapeMarkdown(m.Title)} (${m.Year})\n` +
-          `⭐ IMDb: ${m.imdbRating || 'N/A'}\n` +
-          `📖 ${escapeMarkdown(m.Plot || '')}\n\n` +
-          `📥 Search on bot to request!\n` +
-          `💡 *Visit ${WEBSITE_URL} for 3x speed!*`,
-        parse_mode: 'Markdown'
-      }).catch(e => console.error('[DAILY] sendPhoto upcoming error:', e.message));
-      await new Promise(r => setTimeout(r, 1000));
-    }
-
-    const list = Object.values(movies);
-    if (list.length) {
-      const shuffled = [...list].sort(() => Math.random() - 0.5);
-      const selected = shuffled.slice(0, Math.min(5, list.length));
-      for (const m of selected) {
-        await bot.api.sendVideo(CHANNEL, m.file_id, {
-          caption:
-            `🎬 *Today's Suggestion*\n\n` +
-            `${escapeMarkdown(m.name)} (${m.year || '?'})\n` +
-            `🌐 ${m.language || 'N/A'} | 📺 ${m.quality || 'N/A'}${m.size ? ' | ' + fmtSize(m.size) : ''}\n\n` +
-            `📥 Download using the bot!\n` +
-            `💡 *Visit ${WEBSITE_URL} for 3x speed!*`,
-          parse_mode: 'Markdown'
-        }).catch(e => console.error('[DAILY] sendVideo error:', e.message));
-        await new Promise(r => setTimeout(r, 2000));
+    const local = Object.values(movies);
+    if (local.length) {
+      const pick = [...local].sort(()=>Math.random()-0.5).slice(0,Math.min(5,local.length));
+      for (const m of pick) {
+        try {
+          await bot.api.sendVideo(CHANNEL, m.file_id, { caption: "Today's Pick\n\n" + m.name + ' (' + (m.year||'?') + ')\n' + (m.language||'N/A') + ' | ' + (m.quality||'N/A') + '\n\nDownload using the bot!' });
+          await delay(2000);
+        } catch (err) { console.error('[DAILY local]', err.message); }
       }
     }
 
-    await fs.writeFile(DAILY_FILE, today);
-    console.log('[DAILY] ✅ Post completed for', today);
-  } catch (e) { console.error('[DAILY] Fatal error:', e); }
+    await fs.writeFile('lastDaily.txt', today, 'utf8');
+    console.log('[DAILY] Done for', today);
+  } catch (err) { console.error('[DAILY]', err.message); }
 }
 
-setInterval(() => {
-  sendDailySuggestions().catch(e => console.error('[DAILY] Interval error:', e));
-}, 60 * 60 * 1000);
-
-setTimeout(() => {
-  sendDailySuggestions().catch(e => console.error('[DAILY] Startup error:', e));
-}, 5000);
+setInterval(() => dailyPost().catch(console.error), 60*60*1000);
+setTimeout(() => dailyPost().catch(console.error), 8000);
 
 // ═══════════════════════════════════════
-// 🔄 AUTO GIT PUSH
+// 🔄 GIT PUSH
 // ═══════════════════════════════════════
 function gitPush() {
-  exec(
-    'git pull --rebase origin main && git add . && git diff --cached --quiet || (git commit -m "auto update [skip ci]" && git push)',
+  exec('git add -A && git diff --cached --quiet || (git commit -m "auto [skip ci]" && git push origin main)',
+    { timeout: 30000 },
     (err, stdout, stderr) => {
-      if (err) console.error('[GIT]', stderr);
-      else if (stdout) console.log('[GIT] ✅ Synced');
+      if (err && !String(stderr).includes('nothing to commit')) console.error('[GIT]', String(stderr).slice(0,100));
     }
   );
 }
-setInterval(gitPush, 60000);
+setInterval(gitPush, 5*60*1000);
 
 // ═══════════════════════════════════════
-// 🛑 GLOBAL ERROR HANDLER
+// 🛑 ERROR HANDLING
 // ═══════════════════════════════════════
-bot.catch(err => {
-  console.error('❌ Bot error:', err.error?.message || err);
-});
+bot.catch(err => { console.error('Bot error:', err.error?.message || err.error || err); });
+process.on('unhandledRejection', e => console.error('Unhandled rejection:', e?.message || e));
+process.on('uncaughtException',  e => { console.error('Uncaught exception:', e?.message || e); });
 
 // ═══════════════════════════════════════
 // 🟢 START
 // ═══════════════════════════════════════
-bot.start({ onStart: info => console.log(`🚀 @${info.username} running — grammY`) });
+loadDB().then(() => {
+  console.log('Starting bot...');
+  bot.start({ onStart: info => console.log('Bot running: @' + info.username) });
+}).catch(e => { console.error('Startup failed:', e); process.exit(1); });
 

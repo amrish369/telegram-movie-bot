@@ -1,0 +1,21 @@
+{
+  "f94558deaba2": {
+    "chatId": 5951923988,
+    "messageId": 5589,
+    "movie1": {
+      "id": "m_132",
+      "name": "Eagle",
+      "year": "2024",
+      "votes": 1
+    },
+    "movie2": {
+      "id": "m_3",
+      "name": "Jolly llb 3",
+      "year": "2025",
+      "votes": 0
+    },
+    "voters": {
+      "5951923988": "1"
+    }
+  }
+}

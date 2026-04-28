@@ -10,8 +10,20 @@ const { exec } = require('child_process');
 // ═══════════════════════════════════════
 const BOT_TOKEN    = process.env.BOT_TOKEN;
 const OMDB_API_KEY = process.env.OMDB_API_KEY;
-const ADMIN_ID     = Number(process.env.ADMIN_ID) || 5951923988;
 const CHANNEL      = process.env.CHANNEL || '@cineradarai';
+
+// ── MULTI-ADMIN SUPPORT ──────────────────────────────────────
+// .env mein: ADMIN_ID=111111,222222,333333  (comma separated)
+// Pehla ID = PRIMARY_ADMIN — notifications & convo relays yahan aate hain
+const ADMIN_IDS = new Set(
+  (process.env.ADMIN_ID || '5951923988')
+    .split(',')
+    .map(id => Number(id.trim()))
+    .filter(Boolean)
+);
+const PRIMARY_ADMIN = [...ADMIN_IDS][0];
+function isAdmin(id) { return ADMIN_IDS.has(Number(id)); }
+// ────────────────────────────────────────────────────────────
 const AUTO_DELETE  = 3 * 60 * 1000;
 const WELCOME_GIF  = 'https://media.tenor.com/8d9B7xYkZk0AAAAC/welcome.gif';
 const OMDB_BASE    = 'https://www.omdbapi.com/';
@@ -20,6 +32,46 @@ const INSTAGRAM_URL = 'https://www.instagram.com/_www.compressdocument.in?igsh=M
 
 if (!BOT_TOKEN)    throw new Error('❌ BOT_TOKEN missing in .env');
 if (!OMDB_API_KEY) throw new Error('❌ OMDB_API_KEY missing in .env');
+// ═══════════════════════════════════════
+// 🎭 MOOD MAP — keywords + emojis → genre tags
+// ═══════════════════════════════════════
+const MOOD_MAP = {
+  happy:    { label: '😄 Happy',    emojis: ['😄','😁','😊','🥳','😃','🤩','😀'], keywords: ['comedy','feel good','fun','musical','animation','family'] },
+  sad:      { label: '😢 Sad',      emojis: ['😢','😭','💔','🥺','😞','😔'],       keywords: ['drama','emotional','tragedy','loss','heartbreak'] },
+  romantic: { label: '❤️ Romantic', emojis: ['❤️','🥰','😍','💕','💑','💘','💞'], keywords: ['romance','love','romantic','relationship','couple'] },
+  scary:    { label: '😱 Scary',    emojis: ['😱','👻','🎃','😨','🕷️','🧟','💀'], keywords: ['horror','thriller','scary','suspense','ghost','zombie'] },
+  funny:    { label: '😂 Funny',    emojis: ['😂','🤣','😆','😝','🤪','😜'],       keywords: ['comedy','funny','laugh','spoof','parody'] },
+  action:   { label: '💥 Action',   emojis: ['💥','🔥','⚡','🥊','🏎️','💣','🤜'], keywords: ['action','fight','war','adventure','superhero'] },
+  chill:    { label: '😌 Chill',    emojis: ['😌','🧘','☕','🌙','🛋️','😴'],       keywords: ['slice of life','light','mild','gentle','calm'] },
+  mystery:  { label: '🔍 Mystery',  emojis: ['🔍','🕵️','🤫','🧐','❓','🔎'],       keywords: ['mystery','detective','crime','whodunit','investigation'] },
+};
+
+// Flat emoji → mood lookup
+const EMOJI_TO_MOOD = {};
+Object.entries(MOOD_MAP).forEach(([mood, data]) => {
+  data.emojis.forEach(e => { EMOJI_TO_MOOD[e] = mood; });
+});
+
+function detectMood(text) {
+  if (!text) return null;
+  const lower = text.toLowerCase().trim();
+  for (const mood of Object.keys(MOOD_MAP)) {
+    if (lower === mood || lower.startsWith(mood + ' ') || lower.endsWith(' ' + mood) || lower.includes(mood + ' movie') || lower.includes(mood + ' film')) {
+      return mood;
+    }
+  }
+  // Emoji match
+  for (const char of [...text]) {
+    if (EMOJI_TO_MOOD[char]) return EMOJI_TO_MOOD[char];
+  }
+  return null;
+}
+
+// ═══════════════════════════════════════
+// 🗳️ DEBATE STORAGE
+// debatePolls: chatId → { msgId, movie1, movie2, votes:{userId:1|2}, endTime }
+// ═══════════════════════════════════════
+const debatePolls = new Map();
 
 // ═══════════════════════════════════════
 // 📁 IN-MEMORY DATABASE
@@ -51,6 +103,81 @@ async function loadChatLogs() {
 async function saveChatLogs() {
   await writeJSON('chatLogs.json', chatLogs);
 }
+
+// ═══════════════════════════════════════
+// 🎭 GENRE CACHE
+// movieId → { genre: "Action, Drama", plot: "...", fetched: ISO }
+// OMDB se real genre store karke mood matching accurate banate hain
+// ═══════════════════════════════════════
+let genreCache = {};
+
+async function loadGenreCache() {
+  genreCache = await readJSON('genreCache.json', {});
+}
+async function saveGenreCache() {
+  await writeJSON('genreCache.json', genreCache);
+}
+
+/**
+ * Ek movie ka genre OMDB se fetch karo (cache-first).
+ * Returns genre string like "Action, Drama, Thriller" or null.
+ */
+async function fetchGenreForMovie(movie) {
+  if (!movie?.id) return null;
+  // Cache hit
+  if (genreCache[movie.id]?.genre) return genreCache[movie.id].genre;
+
+  try {
+    const data = await fetchOMDb(movie.name);
+    if (data && data.Genre && data.Genre !== 'N/A') {
+      genreCache[movie.id] = {
+        genre:   data.Genre,
+        plot:    data.Plot !== 'N/A' ? data.Plot : '',
+        rating:  data.imdbRating !== 'N/A' ? data.imdbRating : '',
+        fetched: new Date().toISOString()
+      };
+      saveGenreCache(); // fire-and-forget
+      return data.Genre;
+    }
+  } catch (e) {
+    console.error('[GENRE CACHE]', e.message);
+  }
+  return null;
+}
+
+/**
+ * Mood ke liye OMDB genre se movies filter karo.
+ * Sirf un movies ko fetch karta hai jinka cache missing ho.
+ * Returns filtered movie list (empty array if nothing matches).
+ */
+async function filterMoviesByMood(movieList, mood) {
+  if (!mood || !MOOD_MAP[mood]) return movieList;
+  const moodKeywords = MOOD_MAP[mood].keywords; // e.g. ['horror','thriller','ghost']
+
+  const matched = [];
+
+  // Process movies — cache miss waale batchwise OMDB se fetch karo
+  // Rate limit: 200ms gap between OMDB calls
+  for (const movie of movieList) {
+    let genre = genreCache[movie.id]?.genre || null;
+
+    if (!genre) {
+      // Cache miss — OMDB se fetch karo
+      genre = await fetchGenreForMovie(movie);
+      await new Promise(r => setTimeout(r, 200)); // rate limit
+    }
+
+    if (genre) {
+      const genreLower = genre.toLowerCase();
+      const isMatch = moodKeywords.some(kw => genreLower.includes(kw));
+      if (isMatch) matched.push({ movie, genre });
+    }
+  }
+
+  return matched.map(x => x.movie);
+}
+
+
 
 /**
  * Log a message in chatLogs
@@ -114,7 +241,8 @@ async function loadDB() {
   users    = await readJSON('users.json', {});
   banned   = await readJSON('banned.json', {});
   await loadDailyQueue();
-  await loadChatLogs(); // ← NEW
+  await loadChatLogs();
+  await loadGenreCache(); // ← genre cache for mood search
 
   let needsMigration = false;
   const newMovies = {};
@@ -185,7 +313,7 @@ function scheduleDelete(chatId, ...msgIds) {
 }
 
 async function tempReply(ctx, text, options = {}) {
-  if (ctx.from?.id === ADMIN_ID) {
+  if (isAdmin(ctx.from?.id)) {
     return ctx.reply(text, options);
   }
   try {
@@ -203,7 +331,7 @@ async function tempReply(ctx, text, options = {}) {
 }
 
 async function tempPhoto(ctx, photo, options = {}) {
-  if (ctx.from?.id === ADMIN_ID) {
+  if (isAdmin(ctx.from?.id)) {
     return ctx.replyWithPhoto(photo, options);
   }
   try {
@@ -221,7 +349,7 @@ async function tempPhoto(ctx, photo, options = {}) {
 }
 
 async function tempAnim(ctx, anim, options = {}) {
-  if (ctx.from?.id === ADMIN_ID) {
+  if (isAdmin(ctx.from?.id)) {
     return ctx.replyWithAnimation(anim, options);
   }
   try {
@@ -465,7 +593,7 @@ bot.use(async (ctx, next) => {
   if (!msg) return;
 
   const userId = ctx.from?.id;
-  if (!userId || userId === ADMIN_ID) return;
+  if (!userId || isAdmin(userId)) return;
 
   setTimeout(() => {
     bot.api.deleteMessage(ctx.chat.id, msg.message_id).catch(() => {});
@@ -474,6 +602,130 @@ bot.use(async (ctx, next) => {
 
 bot.use(rateLimit);
 bot.use(banCheck);
+
+// ═══════════════════════════════════════
+// 🔒 CONVO MODE INTERCEPTOR MIDDLEWARE
+// Jab admin kisi user se convo mein ho, us user ke
+// SAARE messages aur commands yahan intercept ho jaate hain.
+// next() call nahi hoti — koi bhi command/search run nahi hogi.
+// Sirf admin ke /endconvo se normal mode wapas aayega.
+// ═══════════════════════════════════════
+bot.use(async (ctx, next) => {
+  const userId = ctx.from?.id;
+  // Sirf non-admin users pe apply karo
+  if (!userId || isAdmin(userId)) return next();
+  // Sirf tab jab convo active ho aur ye user convo target ho
+  if (!adminConvoTarget || adminConvoTarget !== String(userId)) return next();
+
+  // ── Is user ka trackUser update karo ──
+  const msg = ctx.message;
+  if (msg?.from) trackUser(userId, msg.from.first_name, msg.from.username);
+
+  const info = users[String(userId)];
+  const name = info?.username ? `@${info.username}` : info?.first_name || `User ${userId}`;
+
+  // ── Callback queries (inline buttons) allow karo — normal kaam kare ──
+  if (ctx.callbackQuery) return next();
+
+  if (!msg) return; // Koi aur update type — ignore
+
+  // ── Commands block karo ──
+  if (msg.text?.startsWith('/')) {
+    await ctx.reply(
+      `🔒 *Abhi aap admin se baat kar rahe hain.*\n\n` +
+      `Is waqt commands available nahi hain.\n` +
+      `Seedha message karein — admin jawab denge.\n\n` +
+      `_Admin conversation khatam karne ke baad sab normal ho jayega._`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+    return; // next() call nahi — command process nahi hogi
+  }
+
+  // ── Text message → Admin ko relay karo ──
+  if (msg.text) {
+    logMessage(userId, 'user', msg.text);
+    try {
+      const kb = new InlineKeyboard()
+        .text('🛑 Conversation Khatam Karo', 'endconvo_confirm');
+      await bot.api.sendMessage(PRIMARY_ADMIN,
+        `💬 *${escapeMarkdown(name)}* \\(${userId}\\):\n\n${escapeMarkdown(msg.text)}`,
+        { parse_mode: 'Markdown', reply_markup: kb }
+      );
+    } catch (e) {
+      console.error('[CONVO INTERCEPT] Relay failed:', e.message);
+    }
+    return; // next() call nahi — message handler nahi chalega
+  }
+
+  // ── Sticker relay ──
+  if (msg.sticker) {
+    logMessage(userId, 'user', '[Sticker]');
+    try {
+      await bot.api.forwardMessage(PRIMARY_ADMIN, ctx.chat.id, msg.message_id);
+      await bot.api.sendMessage(PRIMARY_ADMIN,
+        `💬 *${escapeMarkdown(name)}* \\(${userId}\\) ne sticker bheja ↑`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch {}
+    return;
+  }
+
+  // ── Photo relay ──
+  if (msg.photo) {
+    logMessage(userId, 'user', '[Photo]' + (msg.caption ? `: ${msg.caption}` : ''));
+    try {
+      const bestPhoto = msg.photo[msg.photo.length - 1];
+      await bot.api.sendPhoto(PRIMARY_ADMIN, bestPhoto.file_id, {
+        caption: `💬 *${escapeMarkdown(name)}* \\(${userId}\\) ne photo bheja` +
+                 (msg.caption ? `:\n"${escapeMarkdown(msg.caption)}"` : ''),
+        parse_mode: 'Markdown'
+      });
+    } catch {}
+    return;
+  }
+
+  // ── Voice relay ──
+  if (msg.voice) {
+    logMessage(userId, 'user', '[Voice message]');
+    try {
+      await bot.api.sendVoice(PRIMARY_ADMIN, msg.voice.file_id, {
+        caption: `💬 *${escapeMarkdown(name)}* \\(${userId}\\) ka voice message ↑`,
+        parse_mode: 'Markdown'
+      });
+    } catch {}
+    return;
+  }
+
+  // ── Video relay ──
+  if (msg.video) {
+    logMessage(userId, 'user', '[Video]');
+    try {
+      await bot.api.forwardMessage(PRIMARY_ADMIN, ctx.chat.id, msg.message_id);
+      await bot.api.sendMessage(PRIMARY_ADMIN,
+        `💬 *${escapeMarkdown(name)}* \\(${userId}\\) ne video bheja ↑`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch {}
+    return;
+  }
+
+  // ── Document relay ──
+  if (msg.document) {
+    logMessage(userId, 'user', `[Document: ${msg.document.file_name || 'file'}]`);
+    try {
+      await bot.api.forwardMessage(PRIMARY_ADMIN, ctx.chat.id, msg.message_id);
+      await bot.api.sendMessage(PRIMARY_ADMIN,
+        `💬 *${escapeMarkdown(name)}* \\(${userId}\\) ne document bheja ↑`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch {}
+    return;
+  }
+
+  // ── Kuch aur — bas block karo ──
+  return;
+  // next() intentionally never called for convo target user
+});
 
 loadDB().then(() => console.log('📀 DB loaded'));
 
@@ -497,6 +749,9 @@ async function finishUpload(ctx, state) {
   movieCounter++;
   await saveDB();
   adminUploadState.delete(ctx.from.id);
+
+  // ── AUTO GENRE CACHE: Upload hote waqt hi genre fetch kar lo ──
+  fetchGenreForMovie(newMovie).catch(() => {}); // fire-and-forget, error ignored
 
   const matchedRequesters = requests.filter(r =>
     (!r.status || r.status === 'Pending') &&
@@ -576,17 +831,20 @@ bot.command('help', async ctx => {
     `🔍 *Search:* Just type movie name (min 3 chars)\n` +
     `📺 *Filters:* Year / Language / Quality buttons appear after search\n` +
     `📩 *Request:* Button appears if movie not found\n\n` +
+    `🎭 *Mood Search:* Type your mood and get instant suggestion!\n` +
+    `   happy • sad • romantic • scary • funny • action • chill • mystery\n` +
+    `   Ya emoji bhejo: 😄 😢 ❤️ 😱 😂 💥 😌 🔍\n\n` +
+    `🎲 /random — Database se random movie\n` +
+    `   Ya sirf "random" type karo\n` +
+    `🗳️ /debate — Do movies ke beech live vote\n\n` +
     `🆕 /new — New Bollywood & South Indian releases\n` +
     `🔮 /upcoming — Upcoming Indian movies\n` +
     `📋 /myrequests — Track your requests\n\n` +
-    `⚡ *3x Fast Download:* Website par ek baar visit karein — normal download seedha milega, fast chahiye toh visit karein\n\n` +
-    `👑 *Admin only:* /edit, /stats, /broadcast, /delete, /ban, /unban, /pending, /search\n` +
-    `               /queue\\_add, /queue\\_view, /queue\\_clear\n` +
-    `               /dm <userId> <message>\n` +
-    `               /history [userId] — Chat history dekhein\n` +
-    `               /delhistory <userId> — History delete karein\n` +
-    `               /convo <userId> — Direct baat karein\n` +
-    `               /endconvo — Conversation khatam karein`;
+    `⚡ *3x Fast Download:* Website par ek baar visit karein\n\n` +
+    `👑 *Admin only:* /edit, /stats, /broadcast, /delete, /ban, /unban\n` +
+    `               /pending, /search, /dm, /history, /delhistory\n` +
+    `               /convo, /endconvo\n` +
+    `               /queue\\_add, /queue\\_view, /queue\\_clear`;
   await tempReply(ctx, helpText, { parse_mode: 'Markdown' });
 });
 
@@ -661,15 +919,174 @@ bot.command('myrequests', async ctx => {
   await tempReply(ctx, txt, { parse_mode: 'Markdown' });
 });
 
-// ─── ADMIN COMMANDS ──────────────────────────────────────────
+// ═══════════════════════════════════════
+// 🎲 /random — Database se random movie
+// ═══════════════════════════════════════
+bot.command('random', async ctx => {
+  trackUser(ctx.from.id, ctx.from.first_name, ctx.from.username);
+  await sendRandomMovie(ctx);
+});
+
+async function sendRandomMovie(ctx, mood = null) {
+  const list = Object.values(movies);
+  if (!list.length) return tempReply(ctx, '❌ Database abhi empty hai. Koi movie available nahi.');
+
+  let pool = list;
+  let moodMatchInfo = '';
+
+  if (mood && MOOD_MAP[mood]) {
+    // ── Loading message dikhao kyunki OMDB calls thodi slow ho sakti hain ──
+    const loadingMsg = await ctx.reply(
+      `🔍 *${MOOD_MAP[mood].label} mood ke liye movies dhundh raha hoon...*\n_OMDB se genre verify ho raha hai_`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => null);
+
+    // Real OMDB genre-based filtering
+    const matched = await filterMoviesByMood(list, mood);
+
+    // Loading message delete karo
+    if (loadingMsg) {
+      bot.api.deleteMessage(ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id, loadingMsg.message_id).catch(() => {});
+    }
+
+    if (matched.length > 0) {
+      pool = matched;
+      moodMatchInfo = `✅ ${matched.length} movies mili ${MOOD_MAP[mood].label} genre se`;
+    } else {
+      // Fallback — koi match nahi mila OMDB genre mein
+      pool = list;
+      moodMatchInfo = `⚠️ Exact genre match nahi mila — random de raha hoon`;
+    }
+  }
+
+  const pick = pool[Math.floor(Math.random() * pool.length)];
+  const moodLabel = mood ? ` — ${MOOD_MAP[mood].label}` : '';
+
+  // Genre info from cache
+  const cached = genreCache[pick.id];
+  const genreLine = cached?.genre ? `🎭 ${escapeMarkdown(cached.genre)}\n` : '';
+  const ratingLine = cached?.rating ? `⭐ IMDb: ${cached.rating}/10\n` : '';
+  const plotLine = cached?.plot ? `\n📖 _${escapeMarkdown(cached.plot.slice(0, 120))}${cached.plot.length > 120 ? '...' : ''}_\n` : '';
+
+  const caption =
+    `🎲 *Random Pick${moodLabel}*\n\n` +
+    `🎬 *${escapeMarkdown(pick.name)}* (${pick.year || '?'})\n` +
+    genreLine +
+    ratingLine +
+    `🌐 ${pick.language || 'N/A'} | 📺 ${pick.quality || 'N/A'}${pick.size ? ' | ' + fmtSize(pick.size) : ''}` +
+    plotLine + `\n` +
+    (moodMatchInfo ? `_${escapeMarkdown(moodMatchInfo)}_\n\n` : '') +
+    `⚡ *3x Fast Download ke liye website visit karein!*`;
+
+  const kb = new InlineKeyboard()
+    .text(`⬇️ Download`, `send_${pick.id}`)
+    .text(`🎲 Aur Ek`, mood ? `rand_mood_${mood}` : 'rand_any')
+    .row()
+    .url('⚡ 3x Fast Download ke liye Website Visit Karein', WEBSITE_URL)
+    .row()
+    .url('📷 Instagram (Optional)', INSTAGRAM_URL);
+
+  return tempReply(ctx, caption, { parse_mode: 'Markdown', reply_markup: kb });
+}
+
+// ═══════════════════════════════════════
+// 🗳️ /debate — Do movies ke beech live vote
+// ═══════════════════════════════════════
+bot.command('debate', async ctx => {
+  trackUser(ctx.from.id, ctx.from.first_name, ctx.from.username);
+  return startDebate(ctx);
+});
+
+// ── Debate core logic — reusable from command AND new_debate button ──
+async function startDebate(ctx) {
+  const list = Object.values(movies);
+  if (list.length < 2) return tempReply(ctx, '❌ Debate ke liye kam se kam 2 movies chahiye database mein.');
+
+  // Pick 2 different random movies
+  const shuffled = [...list].sort(() => Math.random() - 0.5);
+  const [m1, m2] = shuffled;
+  const chatId = ctx.chat?.id;
+  const DEBATE_DURATION = 60; // seconds
+
+  const txt =
+    `🗳️ *Movie Debate — Kaun Behtar Hai?*\n\n` +
+    `1️⃣ *${escapeMarkdown(m1.name)}* (${m1.year || '?'}) — ${m1.language || 'N/A'} | ${m1.quality || 'N/A'}\n\n` +
+    `vs\n\n` +
+    `2️⃣ *${escapeMarkdown(m2.name)}* (${m2.year || '?'}) — ${m2.language || 'N/A'} | ${m2.quality || 'N/A'}\n\n` +
+    `⏱️ *${DEBATE_DURATION} seconds mein vote karo!*\n` +
+    `_Abhi tak: 0 votes_`;
+
+  const kb = new InlineKeyboard()
+    .text(`1️⃣ ${m1.name.slice(0, 22)}`, `debate_vote_1`)
+    .text(`2️⃣ ${m2.name.slice(0, 22)}`, `debate_vote_2`);
+
+  const sent = await ctx.reply(txt, { parse_mode: 'Markdown', reply_markup: kb });
+
+  // Store poll
+  debatePolls.set(chatId, {
+    msgId: sent.message_id,
+    movie1: m1,
+    movie2: m2,
+    votes: {},
+    endTime: Date.now() + DEBATE_DURATION * 1000
+  });
+
+  // Auto-close after DEBATE_DURATION seconds
+  setTimeout(() => closeDebate(ctx.api, chatId), DEBATE_DURATION * 1000);
+}
+
+async function closeDebate(api, chatId) {
+  const poll = debatePolls.get(chatId);
+  if (!poll) return;
+  debatePolls.delete(chatId);
+
+  const v1 = Object.values(poll.votes).filter(v => v === 1).length;
+  const v2 = Object.values(poll.votes).filter(v => v === 2).length;
+  const total = v1 + v2;
+
+  const bar1 = total ? Math.round((v1 / total) * 10) : 0;
+  const bar2 = total ? Math.round((v2 / total) * 10) : 0;
+
+  let winner, winnerMovie;
+  if (v1 > v2)       { winner = `1️⃣ *${escapeMarkdown(poll.movie1.name)}*`; winnerMovie = poll.movie1; }
+  else if (v2 > v1)  { winner = `2️⃣ *${escapeMarkdown(poll.movie2.name)}*`; winnerMovie = poll.movie2; }
+  else               { winner = '🤝 *Tie!* Dono barabar hain'; winnerMovie = null; }
+
+  const resultText =
+    `🗳️ *Debate Result!*\n\n` +
+    `1️⃣ *${escapeMarkdown(poll.movie1.name)}*\n` +
+    `${'🟩'.repeat(bar1)}${'⬜'.repeat(10 - bar1)} ${v1} votes\n\n` +
+    `2️⃣ *${escapeMarkdown(poll.movie2.name)}*\n` +
+    `${'🟦'.repeat(bar2)}${'⬜'.repeat(10 - bar2)} ${v2} votes\n\n` +
+    `🏆 Winner: ${winner}\n` +
+    `👥 Total votes: ${total}`;
+
+  const kb = new InlineKeyboard();
+  if (winnerMovie) {
+    kb.text(`⬇️ ${winnerMovie.name.slice(0, 28)} Download`, `send_${winnerMovie.id}`).row();
+  }
+  kb.text('🗳️ Naya Debate', 'new_debate')
+    .url('⚡ Website Visit Karein', WEBSITE_URL);
+
+  try {
+    await api.editMessageText(chatId, poll.msgId, resultText, {
+      parse_mode: 'Markdown',
+      reply_markup: kb
+    });
+  } catch (e) {
+    console.error('[DEBATE] closeDebate edit failed:', e.message);
+  }
+}
+
+
 bot.command('edit', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
   adminEditMode[ctx.from.id] = !adminEditMode[ctx.from.id];
   ctx.reply(`✏️ Edit mode ${adminEditMode[ctx.from.id] ? '✅ ON' : '❌ OFF'}`);
 });
 
 bot.command('stats', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
   const totalDL = Object.values(movies).reduce((s, m) => s + (m.downloads || 0), 0);
   const usersWithHistory = Object.keys(chatLogs).filter(uid => chatLogs[uid]?.length > 0).length;
   ctx.reply(
@@ -684,7 +1101,7 @@ bot.command('stats', async ctx => {
 });
 
 bot.command('broadcast', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
   const text = ctx.message.text.replace('/broadcast', '').trim();
   if (!text) return ctx.reply('Usage: /broadcast <message>');
   const ids = Object.keys(users);
@@ -702,7 +1119,7 @@ bot.command('broadcast', async ctx => {
 });
 
 bot.command('delete', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
   const id = ctx.message.text.replace('/delete', '').trim();
   if (!movies[id]) return ctx.reply('❌ Movie not found. Use /search to find IDs.');
   const name = movies[id].name;
@@ -712,7 +1129,7 @@ bot.command('delete', async ctx => {
 });
 
 bot.command('ban', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
   const id = ctx.message.text.replace('/ban', '').trim();
   if (!id) return ctx.reply('Usage: /ban <userId>');
   banned[id] = true;
@@ -721,7 +1138,7 @@ bot.command('ban', async ctx => {
 });
 
 bot.command('unban', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
   const id = ctx.message.text.replace('/unban', '').trim();
   delete banned[id];
   await saveBanned();
@@ -734,7 +1151,7 @@ bot.command('unban', async ctx => {
 //        /history <userId> → Specific user ki history
 // ═══════════════════════════════════════
 bot.command('history', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
 
   const targetId = ctx.message.text.replace('/history', '').trim();
 
@@ -849,7 +1266,7 @@ async function showUserHistory(ctx, targetId) {
 // Usage: /delhistory <userId>
 // ═══════════════════════════════════════
 bot.command('delhistory', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
   const targetId = ctx.message.text.replace('/delhistory', '').trim();
   if (!targetId) {
     return ctx.reply(
@@ -889,7 +1306,7 @@ bot.command('delhistory', async ctx => {
 //        /endconvo         → Stop relay
 // ═══════════════════════════════════════
 bot.command('convo', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
 
   const targetId = ctx.message.text.replace('/convo', '').trim();
 
@@ -959,7 +1376,7 @@ bot.command('convo', async ctx => {
 });
 
 bot.command('endconvo', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
   if (!adminConvoTarget) return ctx.reply('❌ Koi active conversation nahi hai.');
 
   const prev = adminConvoTarget;
@@ -979,7 +1396,7 @@ bot.command('endconvo', async ctx => {
 // 📩 /pending
 // ═══════════════════════════════════════
 bot.command('pending', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
 
   try {
     if (!Array.isArray(requests)) requests = [];
@@ -1050,7 +1467,7 @@ bot.command('pending', async ctx => {
 });
 
 bot.command('search', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
   const q = ctx.message.text.replace('/search', '').trim();
   if (!q) return ctx.reply('Usage: /search <name>');
   const res = searchMovies(q);
@@ -1066,7 +1483,7 @@ bot.command('search', async ctx => {
 // 💬 /dm — Single user ko message bhejo
 // ═══════════════════════════════════════
 bot.command('dm', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
 
   const args = ctx.message.text.replace('/dm', '').trim();
   if (!args) {
@@ -1130,7 +1547,7 @@ bot.command('dm', async ctx => {
 
 // ─── ADMIN: DAILY QUEUE MANAGEMENT ──────────────────────────
 bot.command('queue_add', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
   const args = ctx.message.text.split(' ').slice(1);
   if (args.length < 2) return ctx.reply('Usage: /queue_add new|upcoming <movie name>');
   const type = args[0].toLowerCase();
@@ -1154,7 +1571,7 @@ bot.command('queue_add', async ctx => {
 });
 
 bot.command('queue_view', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
   if (dailyQueue.length === 0) return ctx.reply('📭 Queue is empty.');
 
   let text = '📋 *Daily Post Queue*\n\n';
@@ -1168,15 +1585,72 @@ bot.command('queue_view', async ctx => {
 });
 
 bot.command('queue_clear', async ctx => {
-  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
   dailyQueue = [];
   await saveDailyQueue();
   ctx.reply('✅ Queue cleared.');
 });
 
 // ═══════════════════════════════════════
-// 👋 WELCOME HANDLERS
+// 🎭 /cache_genres — Existing saari movies ka genre OMDB se fetch karo
+// Admin use kare ek baar — future mood searches instant honge
 // ═══════════════════════════════════════
+bot.command('cache_genres', async ctx => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
+
+  const allMovies = Object.values(movies);
+  const missing = allMovies.filter(m => !genreCache[m.id]?.genre);
+
+  if (!missing.length) {
+    return ctx.reply(
+      `✅ *Genre Cache Complete!*\n\n` +
+      `🎬 ${allMovies.length} movies — sab cached hain.\n` +
+      `Mood search instant kaam karega!`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  const statusMsg = await ctx.reply(
+    `⏳ *Genre Cache Shuru...*\n\n` +
+    `📋 Total movies: ${allMovies.length}\n` +
+    `🔍 Missing cache: ${missing.length}\n` +
+    `⏱️ ~${Math.ceil(missing.length * 0.3)} seconds lagenge\n\n` +
+    `_Ek baar ho gaya toh sab instant hoga_`,
+    { parse_mode: 'Markdown' }
+  );
+
+  let done = 0, failed = 0;
+
+  for (const movie of missing) {
+    const genre = await fetchGenreForMovie(movie);
+    if (genre) done++;
+    else failed++;
+    await new Promise(r => setTimeout(r, 300)); // rate limit
+
+    // Progress update every 10 movies
+    if ((done + failed) % 10 === 0) {
+      bot.api.editMessageText(ctx.chat.id, statusMsg.message_id,
+        `⏳ *Genre Cache Progress...*\n\n` +
+        `✅ Done: ${done + failed}/${missing.length}\n` +
+        `🎭 Found: ${done} | ❌ Not found: ${failed}`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    }
+  }
+
+  await saveGenreCache();
+
+  bot.api.editMessageText(ctx.chat.id, statusMsg.message_id,
+    `✅ *Genre Cache Complete!*\n\n` +
+    `🎬 Total movies: ${allMovies.length}\n` +
+    `🎭 Genre cached: ${done}\n` +
+    `❌ Not found on OMDB: ${failed}\n\n` +
+    `Mood search ab ${MOOD_MAP ? Object.keys(MOOD_MAP).join(', ') : ''} genres se match karega!`,
+    { parse_mode: 'Markdown' }
+  ).catch(() => {});
+});
+
+
 bot.on('message:new_chat_members', async ctx => {
   const newMembers = ctx.message.new_chat_members;
   for (const member of newMembers) {
@@ -1230,52 +1704,12 @@ bot.on('my_chat_member', async ctx => {
 bot.on('message', async (ctx, next) => {
   const msg     = ctx.message;
   const userId  = msg.from.id;
-  const isAdmin = userId === ADMIN_ID;
+  const isAdmin = ADMIN_IDS.has(userId);
 
   trackUser(userId, msg.from.first_name, msg.from.username);
 
   // ══════════════════════════════════════════════════════
-  // 💬 CONVO RELAY — User → Admin forwarding (NEW)
-  // If this user is the current convo target, forward their
-  // message to admin (even before other checks)
-  // ══════════════════════════════════════════════════════
-  if (!isAdmin && adminConvoTarget === String(userId)) {
-    const info = users[String(userId)];
-    const name = info?.username ? `@${info.username}` : info?.first_name || `User ${userId}`;
-
-    // Forward the message content to admin
-    if (msg.text && !msg.text.startsWith('/')) {
-      // Log it
-      logMessage(userId, 'user', msg.text);
-
-      try {
-        const kb = new InlineKeyboard()
-          .text('🛑 End Conversation', 'endconvo_confirm');
-
-        await bot.api.sendMessage(ADMIN_ID,
-          `💬 *${escapeMarkdown(name)}* \\(${userId}\\) ka reply:\n\n` +
-          `"${escapeMarkdown(msg.text)}"`,
-          { parse_mode: 'Markdown', reply_markup: kb }
-        );
-      } catch (e) {
-        console.error('[CONVO RELAY] Forward to admin failed:', e.message);
-      }
-    } else if (msg.sticker) {
-      logMessage(userId, 'user', '[Sticker]');
-      await bot.api.sendMessage(ADMIN_ID, `💬 *${escapeMarkdown(name)}* ne sticker bheja.`, { parse_mode: 'Markdown' }).catch(() => {});
-    } else if (msg.photo) {
-      logMessage(userId, 'user', '[Photo]');
-      const caption = msg.caption ? `: "${msg.caption}"` : '';
-      await bot.api.sendMessage(ADMIN_ID, `💬 *${escapeMarkdown(name)}* ne photo bheja${caption}.`, { parse_mode: 'Markdown' }).catch(() => {});
-    } else if (msg.voice) {
-      logMessage(userId, 'user', '[Voice message]');
-      await bot.api.sendMessage(ADMIN_ID, `💬 *${escapeMarkdown(name)}* ne voice message bheja.`, { parse_mode: 'Markdown' }).catch(() => {});
-    }
-    // Still fall through so user gets normal bot response too
-  }
-
-  // ══════════════════════════════════════════════════════
-  // 💬 CONVO RELAY — Admin → User forwarding (NEW)
+  // 💬 CONVO RELAY — Admin → User forwarding
   // If admin is in convo mode and sends a plain text message
   // (not a command), relay it to the target user
   // ══════════════════════════════════════════════════════
@@ -1375,6 +1809,33 @@ bot.on('message', async (ctx, next) => {
   // ── Log user search message ──
   if (!isAdmin) {
     logMessage(userId, 'user', rawQuery);
+  }
+
+  // ══════════════════════════════════════════════════════
+  // 🎭 MOOD DETECTION — "happy", "sad", 😂 emoji etc.
+  // ══════════════════════════════════════════════════════
+  const detectedMood = detectMood(rawQuery);
+  if (detectedMood) {
+    const moodData = MOOD_MAP[detectedMood];
+    await sendRandomMovie(ctx, detectedMood);
+    // Also show mood keyboard for other moods (3 per row)
+    const kb = new InlineKeyboard();
+    const otherMoods = Object.entries(MOOD_MAP).filter(([mood]) => mood !== detectedMood);
+    otherMoods.forEach(([mood, data], idx) => {
+      kb.text(data.label, `mood_${mood}`);
+      if ((idx + 1) % 3 === 0) kb.row();
+    });
+    kb.row();
+    await tempReply(ctx,
+      `${moodData.label} mood detect kiya! Aur moods try karo:`,
+      { parse_mode: 'Markdown', reply_markup: kb }
+    );
+    return;
+  }
+
+  // ── "random" keyword ──
+  if (rawQuery.toLowerCase().trim() === 'random' || rawQuery.toLowerCase().includes('random movie')) {
+    return sendRandomMovie(ctx);
   }
 
   const { movieName: parsedName, year: parsedYear, language: parsedLang } = parseQuery(rawQuery);
@@ -1524,9 +1985,84 @@ bot.on('callback_query:data', async ctx => {
   const userId = ctx.from.id;
   const chatId = ctx.callbackQuery.message?.chat?.id;
 
+  // ── 🎲 Random movie callback ──
+  if (data === 'rand_any') {
+    await ctx.answerCallbackQuery({ text: '🎲 Naya random pick...' });
+    return sendRandomMovie(ctx);
+  }
+  if (data.startsWith('rand_mood_')) {
+    const mood = data.slice('rand_mood_'.length);
+    await ctx.answerCallbackQuery({ text: `🎲 ${MOOD_MAP[mood]?.label || mood} random...` });
+    return sendRandomMovie(ctx, mood);
+  }
+
+  // ── 🎭 Mood keyboard callback ──
+  if (data.startsWith('mood_')) {
+    const mood = data.slice('mood_'.length);
+    if (!MOOD_MAP[mood]) return ctx.answerCallbackQuery({ text: '❌ Invalid mood' });
+    await ctx.answerCallbackQuery({ text: `${MOOD_MAP[mood].label} movies dekh rahe hain...` });
+    return sendRandomMovie(ctx, mood);
+  }
+
+  // ── 🗳️ Debate vote callback ──
+  if (data === 'debate_vote_1' || data === 'debate_vote_2') {
+    const chatId = ctx.callbackQuery.message?.chat?.id;
+    const poll = debatePolls.get(chatId);
+
+    if (!poll) return ctx.answerCallbackQuery({ text: '⏰ Vote time khatam ho gaya!', show_alert: true });
+    if (Date.now() > poll.endTime) {
+      debatePolls.delete(chatId);
+      return ctx.answerCallbackQuery({ text: '⏰ Debate khatam ho gaya!', show_alert: true });
+    }
+
+    const choice = data === 'debate_vote_1' ? 1 : 2;
+    const prevVote = poll.votes[userId];
+
+    if (prevVote === choice) {
+      return ctx.answerCallbackQuery({ text: '✅ Tumne pehle se yahi vote diya hai!', show_alert: false });
+    }
+
+    poll.votes[userId] = choice;
+
+    const v1 = Object.values(poll.votes).filter(v => v === 1).length;
+    const v2 = Object.values(poll.votes).filter(v => v === 2).length;
+    const total = v1 + v2;
+    const secsLeft = Math.max(0, Math.round((poll.endTime - Date.now()) / 1000));
+
+    // Update message with live vote count
+    const liveText =
+      `🗳️ *Movie Debate — Kaun Behtar Hai?*\n\n` +
+      `1️⃣ *${escapeMarkdown(poll.movie1.name)}* (${poll.movie1.year || '?'})\n\n` +
+      `vs\n\n` +
+      `2️⃣ *${escapeMarkdown(poll.movie2.name)}* (${poll.movie2.year || '?'})\n\n` +
+      `📊 *Live Results:*\n` +
+      `1️⃣ ${v1} votes  |  2️⃣ ${v2} votes\n` +
+      `👥 Total: ${total} | ⏱️ ${secsLeft}s baaki`;
+
+    const kb = new InlineKeyboard()
+      .text(`1️⃣ ${poll.movie1.name.slice(0, 22)} (${v1})`, `debate_vote_1`)
+      .text(`2️⃣ ${poll.movie2.name.slice(0, 22)} (${v2})`, `debate_vote_2`);
+
+    try {
+      await ctx.editMessageText(liveText, { parse_mode: 'Markdown', reply_markup: kb });
+    } catch {}
+
+    const movieName = choice === 1 ? poll.movie1.name : poll.movie2.name;
+    return ctx.answerCallbackQuery({
+      text: `${prevVote ? '🔄 Vote badal diya!' : '✅ Vote diya!'} — ${movieName.slice(0, 30)}`,
+      show_alert: false
+    });
+  }
+
+  // ── 🗳️ New debate (result screen ka button) ──
+  if (data === 'new_debate') {
+    await ctx.answerCallbackQuery({ text: '🗳️ Naya debate shuru ho raha hai!' });
+    return startDebate(ctx); // Direct call — /debate text bhejne se command trigger nahi hota
+  }
+
   // ── End convo confirm (from inline button) ── (NEW)
   if (data === 'endconvo_confirm') {
-    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     if (!adminConvoTarget) return ctx.answerCallbackQuery({ text: 'No active conversation', show_alert: true });
     const prev = adminConvoTarget;
     const info = users[prev];
@@ -1539,7 +2075,7 @@ bot.on('callback_query:data', async ctx => {
 
   // ── View user history (from /history list button) ── (NEW)
   if (data.startsWith('hist_view_')) {
-    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const targetId = data.slice('hist_view_'.length);
     await ctx.answerCallbackQuery({ text: '📋 Loading history...' });
     return showUserHistory(ctx, targetId);
@@ -1547,7 +2083,7 @@ bot.on('callback_query:data', async ctx => {
 
   // ── Delete user history (from inline button) ── (NEW)
   if (data.startsWith('delh_')) {
-    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const targetId = data.slice('delh_'.length);
     const info = users[String(targetId)];
     const name = info?.username ? `@${info.username}` : info?.first_name || `User ${targetId}`;
@@ -1572,7 +2108,7 @@ bot.on('callback_query:data', async ctx => {
 
   // ── Start convo (from history view button) ── (NEW)
   if (data.startsWith('startconvo_')) {
-    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const targetId = data.slice('startconvo_'.length);
     adminConvoTarget = String(targetId);
     const info = users[String(targetId)];
@@ -1620,7 +2156,7 @@ bot.on('callback_query:data', async ctx => {
 
   // ── Language selection during upload ──
   if (data.startsWith('ul_lang_')) {
-    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const state = adminUploadState.get(userId);
     if (!state) return ctx.answerCallbackQuery({ text: '❌ No active upload session', show_alert: true });
     const lang = data.slice('ul_lang_'.length);
@@ -1636,7 +2172,7 @@ bot.on('callback_query:data', async ctx => {
 
   // ── Quality selection during upload ──
   if (data.startsWith('ul_qual_')) {
-    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const state = adminUploadState.get(userId);
     if (!state) return ctx.answerCallbackQuery({ text: '❌ No active upload session', show_alert: true });
     state.quality = data.slice('ul_qual_'.length);
@@ -1678,7 +2214,7 @@ bot.on('callback_query:data', async ctx => {
 
     try {
       const sent = await ctx.replyWithVideo(m.file_id, { caption, parse_mode: 'Markdown', reply_markup: kb });
-      if (userId !== ADMIN_ID && chatId) {
+      if (!isAdmin(userId) && chatId) {
         scheduleDelete(chatId, sent.message_id);
       }
       return ctx.answerCallbackQuery({ text: `📥 ${m.name} download ho rahi hai!` });
@@ -1706,7 +2242,7 @@ bot.on('callback_query:data', async ctx => {
     const kb = new InlineKeyboard();
     results.forEach(m => {
       kb.text(movieBtnLabel(m), `send_${m.id}`).row();
-      if (userId === ADMIN_ID && adminEditMode[userId]) {
+      if (isAdmin(userId) && adminEditMode[userId]) {
         kb.text(`✏️ Edit`, `edit_${m.id}`).row();
       }
     });
@@ -1734,7 +2270,7 @@ bot.on('callback_query:data', async ctx => {
     logMessage(userId, 'user', `[Request] ${movieName}`);
     await tempReply(ctx, `✅ *Request sent for "${escapeMarkdown(movieName)}"!*\n\nUse /myrequests to track.`, { parse_mode: 'Markdown' });
     try {
-      await bot.api.sendMessage(ADMIN_ID,
+      await bot.api.sendMessage(PRIMARY_ADMIN,
         `📩 *New Request*\n\n🎬 ${escapeMarkdown(movieName)}\n👤 User: ${userId}`,
         { parse_mode: 'Markdown' });
     } catch {}
@@ -1743,7 +2279,7 @@ bot.on('callback_query:data', async ctx => {
 
   // ── Edit movie (admin) ──
   if (data.startsWith('edit_')) {
-    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const mid = data.slice('edit_'.length);
     const m = movies[mid];
     if (!m) return ctx.answerCallbackQuery({ text: '❌ Not found' });
@@ -1757,7 +2293,7 @@ bot.on('callback_query:data', async ctx => {
   }
 
   if (data.startsWith('ef_')) {
-    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const field = data.slice('ef_'.length);
     if (field === 'cancel') {
       delete adminEditState[userId];
@@ -1779,7 +2315,7 @@ bot.on('callback_query:data', async ctx => {
 
   // ── Mark request fulfilled — index-based ──
   if (data.startsWith('rdi_')) {
-    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
 
     const origIdx = parseInt(data.slice('rdi_'.length));
     if (isNaN(origIdx) || origIdx < 0 || origIdx >= requests.length) {
@@ -1864,7 +2400,7 @@ bot.on('callback_query:data', async ctx => {
 
   // ── Legacy req_done_ handler ──
   if (data.startsWith('req_done_')) {
-    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const rest      = data.slice('req_done_'.length);
     const uIdx      = rest.indexOf('_');
     const reqUser   = rest.slice(0, uIdx);
@@ -1902,7 +2438,7 @@ bot.on('callback_query:data', async ctx => {
 
   // ── Post to channel (admin) ──
   if (data.startsWith('post_to_channel_')) {
-    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const movieId = data.slice('post_to_channel_'.length);
     const m = movies[movieId];
     if (!m) return ctx.answerCallbackQuery({ text: '❌ Movie not found' });
@@ -2049,5 +2585,8 @@ bot.catch(err => {
 // ═══════════════════════════════════════
 // 🟢 START
 // ═══════════════════════════════════════
-bot.start({ onStart: info => console.log(`🚀 @${info.username} running — grammY`) });
+bot.start({
+  drop_pending_updates: true,
+  onStart: info => console.log(`🚀 @${info.username} running — grammY`)
+});
 

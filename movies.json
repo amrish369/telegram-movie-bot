@@ -99,7 +99,8 @@
     "year": "2025",
     "language": "Dual Audio",
     "quality": "1080p",
-    "size": null
+    "size": null,
+    "downloads": 2
   },
   "m_11": {
     "id": "m_11",
@@ -130,7 +131,7 @@
     "language": "Hindi",
     "quality": "1080p",
     "size": null,
-    "downloads": 8
+    "downloads": 9
   },
   "m_14": {
     "id": "m_14",
@@ -1774,7 +1775,7 @@
     "language": "Hindi",
     "quality": "480p",
     "size": 739855284,
-    "downloads": 1,
+    "downloads": 2,
     "added": "2026-04-17T15:15:48.913Z"
   },
   "m_168": {
@@ -1846,7 +1847,7 @@
     "language": "Hindi",
     "quality": "720p",
     "size": 1113645877,
-    "downloads": 0,
+    "downloads": 1,
     "added": "2026-04-17T15:20:46.483Z"
   },
   "m_174": {
@@ -2026,7 +2027,7 @@
     "language": "Hindi",
     "quality": "720p",
     "size": 1780605624,
-    "downloads": 68,
+    "downloads": 69,
     "added": "2026-04-18T14:32:51.303Z"
   },
   "m_189": {
@@ -2038,7 +2039,7 @@
     "language": "Hindi",
     "quality": "480p",
     "size": 838698271,
-    "downloads": 32,
+    "downloads": 33,
     "added": "2026-04-18T14:33:44.269Z"
   },
   "m_190": {
@@ -2110,7 +2111,7 @@
     "language": "Hindi",
     "quality": "1080p",
     "size": 3608696608,
-    "downloads": 41,
+    "downloads": 44,
     "added": "2026-04-19T03:25:42.954Z"
   },
   "m_196": {
@@ -2134,7 +2135,7 @@
     "language": "Hindi",
     "quality": "1080p",
     "size": 2364993123,
-    "downloads": 27,
+    "downloads": 31,
     "added": "2026-04-19T04:13:43.970Z"
   },
   "m_198": {

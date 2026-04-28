@@ -10,20 +10,8 @@ const { exec } = require('child_process');
 // ═══════════════════════════════════════
 const BOT_TOKEN    = process.env.BOT_TOKEN;
 const OMDB_API_KEY = process.env.OMDB_API_KEY;
+const ADMIN_ID     = Number(process.env.ADMIN_ID) || 5951923988;
 const CHANNEL      = process.env.CHANNEL || '@cineradarai';
-
-// ── MULTI-ADMIN SUPPORT ──────────────────────────────────────
-// .env mein: ADMIN_ID=111111,222222,333333  (comma separated)
-// Pehla ID = PRIMARY_ADMIN — notifications & convo relays yahan aate hain
-const ADMIN_IDS = new Set(
-  (process.env.ADMIN_ID || '5951923988')
-    .split(',')
-    .map(id => Number(id.trim()))
-    .filter(Boolean)
-);
-const PRIMARY_ADMIN = [...ADMIN_IDS][0];
-function isAdmin(id) { return ADMIN_IDS.has(Number(id)); }
-// ────────────────────────────────────────────────────────────
 const AUTO_DELETE  = 3 * 60 * 1000;
 const WELCOME_GIF  = 'https://media.tenor.com/8d9B7xYkZk0AAAAC/welcome.gif';
 const OMDB_BASE    = 'https://www.omdbapi.com/';
@@ -197,7 +185,7 @@ function scheduleDelete(chatId, ...msgIds) {
 }
 
 async function tempReply(ctx, text, options = {}) {
-  if (isAdmin(ctx.from?.id)) {
+  if (ctx.from?.id === ADMIN_ID) {
     return ctx.reply(text, options);
   }
   try {
@@ -215,7 +203,7 @@ async function tempReply(ctx, text, options = {}) {
 }
 
 async function tempPhoto(ctx, photo, options = {}) {
-  if (isAdmin(ctx.from?.id)) {
+  if (ctx.from?.id === ADMIN_ID) {
     return ctx.replyWithPhoto(photo, options);
   }
   try {
@@ -233,7 +221,7 @@ async function tempPhoto(ctx, photo, options = {}) {
 }
 
 async function tempAnim(ctx, anim, options = {}) {
-  if (isAdmin(ctx.from?.id)) {
+  if (ctx.from?.id === ADMIN_ID) {
     return ctx.replyWithAnimation(anim, options);
   }
   try {
@@ -477,7 +465,7 @@ bot.use(async (ctx, next) => {
   if (!msg) return;
 
   const userId = ctx.from?.id;
-  if (!userId || isAdmin(userId)) return;
+  if (!userId || userId === ADMIN_ID) return;
 
   setTimeout(() => {
     bot.api.deleteMessage(ctx.chat.id, msg.message_id).catch(() => {});
@@ -486,130 +474,6 @@ bot.use(async (ctx, next) => {
 
 bot.use(rateLimit);
 bot.use(banCheck);
-
-// ═══════════════════════════════════════
-// 🔒 CONVO MODE INTERCEPTOR MIDDLEWARE
-// Jab admin kisi user se convo mein ho, us user ke
-// SAARE messages aur commands yahan intercept ho jaate hain.
-// next() call nahi hoti — koi bhi command/search run nahi hogi.
-// Sirf admin ke /endconvo se normal mode wapas aayega.
-// ═══════════════════════════════════════
-bot.use(async (ctx, next) => {
-  const userId = ctx.from?.id;
-  // Sirf non-admin users pe apply karo
-  if (!userId || isAdmin(userId)) return next();
-  // Sirf tab jab convo active ho aur ye user convo target ho
-  if (!adminConvoTarget || adminConvoTarget !== String(userId)) return next();
-
-  // ── Is user ka trackUser update karo ──
-  const msg = ctx.message;
-  if (msg?.from) trackUser(userId, msg.from.first_name, msg.from.username);
-
-  const info = users[String(userId)];
-  const name = info?.username ? `@${info.username}` : info?.first_name || `User ${userId}`;
-
-  // ── Callback queries (inline buttons) allow karo — normal kaam kare ──
-  if (ctx.callbackQuery) return next();
-
-  if (!msg) return; // Koi aur update type — ignore
-
-  // ── Commands block karo ──
-  if (msg.text?.startsWith('/')) {
-    await ctx.reply(
-      `🔒 *Abhi aap admin se baat kar rahe hain.*\n\n` +
-      `Is waqt commands available nahi hain.\n` +
-      `Seedha message karein — admin jawab denge.\n\n` +
-      `_Admin conversation khatam karne ke baad sab normal ho jayega._`,
-      { parse_mode: 'Markdown' }
-    ).catch(() => {});
-    return; // next() call nahi — command process nahi hogi
-  }
-
-  // ── Text message → Admin ko relay karo ──
-  if (msg.text) {
-    logMessage(userId, 'user', msg.text);
-    try {
-      const kb = new InlineKeyboard()
-        .text('🛑 Conversation Khatam Karo', 'endconvo_confirm');
-      await bot.api.sendMessage(PRIMARY_ADMIN,
-        `💬 *${escapeMarkdown(name)}* \\(${userId}\\):\n\n${escapeMarkdown(msg.text)}`,
-        { parse_mode: 'Markdown', reply_markup: kb }
-      );
-    } catch (e) {
-      console.error('[CONVO INTERCEPT] Relay failed:', e.message);
-    }
-    return; // next() call nahi — message handler nahi chalega
-  }
-
-  // ── Sticker relay ──
-  if (msg.sticker) {
-    logMessage(userId, 'user', '[Sticker]');
-    try {
-      await bot.api.forwardMessage(PRIMARY_ADMIN, ctx.chat.id, msg.message_id);
-      await bot.api.sendMessage(PRIMARY_ADMIN,
-        `💬 *${escapeMarkdown(name)}* \\(${userId}\\) ne sticker bheja ↑`,
-        { parse_mode: 'Markdown' }
-      );
-    } catch {}
-    return;
-  }
-
-  // ── Photo relay ──
-  if (msg.photo) {
-    logMessage(userId, 'user', '[Photo]' + (msg.caption ? `: ${msg.caption}` : ''));
-    try {
-      const bestPhoto = msg.photo[msg.photo.length - 1];
-      await bot.api.sendPhoto(PRIMARY_ADMIN, bestPhoto.file_id, {
-        caption: `💬 *${escapeMarkdown(name)}* \\(${userId}\\) ne photo bheja` +
-                 (msg.caption ? `:\n"${escapeMarkdown(msg.caption)}"` : ''),
-        parse_mode: 'Markdown'
-      });
-    } catch {}
-    return;
-  }
-
-  // ── Voice relay ──
-  if (msg.voice) {
-    logMessage(userId, 'user', '[Voice message]');
-    try {
-      await bot.api.sendVoice(PRIMARY_ADMIN, msg.voice.file_id, {
-        caption: `💬 *${escapeMarkdown(name)}* \\(${userId}\\) ka voice message ↑`,
-        parse_mode: 'Markdown'
-      });
-    } catch {}
-    return;
-  }
-
-  // ── Video relay ──
-  if (msg.video) {
-    logMessage(userId, 'user', '[Video]');
-    try {
-      await bot.api.forwardMessage(PRIMARY_ADMIN, ctx.chat.id, msg.message_id);
-      await bot.api.sendMessage(PRIMARY_ADMIN,
-        `💬 *${escapeMarkdown(name)}* \\(${userId}\\) ne video bheja ↑`,
-        { parse_mode: 'Markdown' }
-      );
-    } catch {}
-    return;
-  }
-
-  // ── Document relay ──
-  if (msg.document) {
-    logMessage(userId, 'user', `[Document: ${msg.document.file_name || 'file'}]`);
-    try {
-      await bot.api.forwardMessage(PRIMARY_ADMIN, ctx.chat.id, msg.message_id);
-      await bot.api.sendMessage(PRIMARY_ADMIN,
-        `💬 *${escapeMarkdown(name)}* \\(${userId}\\) ne document bheja ↑`,
-        { parse_mode: 'Markdown' }
-      );
-    } catch {}
-    return;
-  }
-
-  // ── Kuch aur — bas block karo ──
-  return;
-  // next() intentionally never called for convo target user
-});
 
 loadDB().then(() => console.log('📀 DB loaded'));
 
@@ -799,13 +663,13 @@ bot.command('myrequests', async ctx => {
 
 // ─── ADMIN COMMANDS ──────────────────────────────────────────
 bot.command('edit', async ctx => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
   adminEditMode[ctx.from.id] = !adminEditMode[ctx.from.id];
   ctx.reply(`✏️ Edit mode ${adminEditMode[ctx.from.id] ? '✅ ON' : '❌ OFF'}`);
 });
 
 bot.command('stats', async ctx => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
   const totalDL = Object.values(movies).reduce((s, m) => s + (m.downloads || 0), 0);
   const usersWithHistory = Object.keys(chatLogs).filter(uid => chatLogs[uid]?.length > 0).length;
   ctx.reply(
@@ -820,7 +684,7 @@ bot.command('stats', async ctx => {
 });
 
 bot.command('broadcast', async ctx => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
   const text = ctx.message.text.replace('/broadcast', '').trim();
   if (!text) return ctx.reply('Usage: /broadcast <message>');
   const ids = Object.keys(users);
@@ -838,7 +702,7 @@ bot.command('broadcast', async ctx => {
 });
 
 bot.command('delete', async ctx => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
   const id = ctx.message.text.replace('/delete', '').trim();
   if (!movies[id]) return ctx.reply('❌ Movie not found. Use /search to find IDs.');
   const name = movies[id].name;
@@ -848,7 +712,7 @@ bot.command('delete', async ctx => {
 });
 
 bot.command('ban', async ctx => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
   const id = ctx.message.text.replace('/ban', '').trim();
   if (!id) return ctx.reply('Usage: /ban <userId>');
   banned[id] = true;
@@ -857,7 +721,7 @@ bot.command('ban', async ctx => {
 });
 
 bot.command('unban', async ctx => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
   const id = ctx.message.text.replace('/unban', '').trim();
   delete banned[id];
   await saveBanned();
@@ -870,7 +734,7 @@ bot.command('unban', async ctx => {
 //        /history <userId> → Specific user ki history
 // ═══════════════════════════════════════
 bot.command('history', async ctx => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
 
   const targetId = ctx.message.text.replace('/history', '').trim();
 
@@ -985,7 +849,7 @@ async function showUserHistory(ctx, targetId) {
 // Usage: /delhistory <userId>
 // ═══════════════════════════════════════
 bot.command('delhistory', async ctx => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
   const targetId = ctx.message.text.replace('/delhistory', '').trim();
   if (!targetId) {
     return ctx.reply(
@@ -1025,7 +889,7 @@ bot.command('delhistory', async ctx => {
 //        /endconvo         → Stop relay
 // ═══════════════════════════════════════
 bot.command('convo', async ctx => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
 
   const targetId = ctx.message.text.replace('/convo', '').trim();
 
@@ -1095,7 +959,7 @@ bot.command('convo', async ctx => {
 });
 
 bot.command('endconvo', async ctx => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
   if (!adminConvoTarget) return ctx.reply('❌ Koi active conversation nahi hai.');
 
   const prev = adminConvoTarget;
@@ -1115,7 +979,7 @@ bot.command('endconvo', async ctx => {
 // 📩 /pending
 // ═══════════════════════════════════════
 bot.command('pending', async ctx => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
 
   try {
     if (!Array.isArray(requests)) requests = [];
@@ -1186,7 +1050,7 @@ bot.command('pending', async ctx => {
 });
 
 bot.command('search', async ctx => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
   const q = ctx.message.text.replace('/search', '').trim();
   if (!q) return ctx.reply('Usage: /search <name>');
   const res = searchMovies(q);
@@ -1202,7 +1066,7 @@ bot.command('search', async ctx => {
 // 💬 /dm — Single user ko message bhejo
 // ═══════════════════════════════════════
 bot.command('dm', async ctx => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
 
   const args = ctx.message.text.replace('/dm', '').trim();
   if (!args) {
@@ -1266,7 +1130,7 @@ bot.command('dm', async ctx => {
 
 // ─── ADMIN: DAILY QUEUE MANAGEMENT ──────────────────────────
 bot.command('queue_add', async ctx => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
   const args = ctx.message.text.split(' ').slice(1);
   if (args.length < 2) return ctx.reply('Usage: /queue_add new|upcoming <movie name>');
   const type = args[0].toLowerCase();
@@ -1290,7 +1154,7 @@ bot.command('queue_add', async ctx => {
 });
 
 bot.command('queue_view', async ctx => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
   if (dailyQueue.length === 0) return ctx.reply('📭 Queue is empty.');
 
   let text = '📋 *Daily Post Queue*\n\n';
@@ -1304,7 +1168,7 @@ bot.command('queue_view', async ctx => {
 });
 
 bot.command('queue_clear', async ctx => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
   dailyQueue = [];
   await saveDailyQueue();
   ctx.reply('✅ Queue cleared.');
@@ -1366,12 +1230,52 @@ bot.on('my_chat_member', async ctx => {
 bot.on('message', async (ctx, next) => {
   const msg     = ctx.message;
   const userId  = msg.from.id;
-  const isAdmin = ADMIN_IDS.has(userId);
+  const isAdmin = userId === ADMIN_ID;
 
   trackUser(userId, msg.from.first_name, msg.from.username);
 
   // ══════════════════════════════════════════════════════
-  // 💬 CONVO RELAY — Admin → User forwarding
+  // 💬 CONVO RELAY — User → Admin forwarding (NEW)
+  // If this user is the current convo target, forward their
+  // message to admin (even before other checks)
+  // ══════════════════════════════════════════════════════
+  if (!isAdmin && adminConvoTarget === String(userId)) {
+    const info = users[String(userId)];
+    const name = info?.username ? `@${info.username}` : info?.first_name || `User ${userId}`;
+
+    // Forward the message content to admin
+    if (msg.text && !msg.text.startsWith('/')) {
+      // Log it
+      logMessage(userId, 'user', msg.text);
+
+      try {
+        const kb = new InlineKeyboard()
+          .text('🛑 End Conversation', 'endconvo_confirm');
+
+        await bot.api.sendMessage(ADMIN_ID,
+          `💬 *${escapeMarkdown(name)}* \\(${userId}\\) ka reply:\n\n` +
+          `"${escapeMarkdown(msg.text)}"`,
+          { parse_mode: 'Markdown', reply_markup: kb }
+        );
+      } catch (e) {
+        console.error('[CONVO RELAY] Forward to admin failed:', e.message);
+      }
+    } else if (msg.sticker) {
+      logMessage(userId, 'user', '[Sticker]');
+      await bot.api.sendMessage(ADMIN_ID, `💬 *${escapeMarkdown(name)}* ne sticker bheja.`, { parse_mode: 'Markdown' }).catch(() => {});
+    } else if (msg.photo) {
+      logMessage(userId, 'user', '[Photo]');
+      const caption = msg.caption ? `: "${msg.caption}"` : '';
+      await bot.api.sendMessage(ADMIN_ID, `💬 *${escapeMarkdown(name)}* ne photo bheja${caption}.`, { parse_mode: 'Markdown' }).catch(() => {});
+    } else if (msg.voice) {
+      logMessage(userId, 'user', '[Voice message]');
+      await bot.api.sendMessage(ADMIN_ID, `💬 *${escapeMarkdown(name)}* ne voice message bheja.`, { parse_mode: 'Markdown' }).catch(() => {});
+    }
+    // Still fall through so user gets normal bot response too
+  }
+
+  // ══════════════════════════════════════════════════════
+  // 💬 CONVO RELAY — Admin → User forwarding (NEW)
   // If admin is in convo mode and sends a plain text message
   // (not a command), relay it to the target user
   // ══════════════════════════════════════════════════════
@@ -1622,7 +1526,7 @@ bot.on('callback_query:data', async ctx => {
 
   // ── End convo confirm (from inline button) ── (NEW)
   if (data === 'endconvo_confirm') {
-    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     if (!adminConvoTarget) return ctx.answerCallbackQuery({ text: 'No active conversation', show_alert: true });
     const prev = adminConvoTarget;
     const info = users[prev];
@@ -1635,7 +1539,7 @@ bot.on('callback_query:data', async ctx => {
 
   // ── View user history (from /history list button) ── (NEW)
   if (data.startsWith('hist_view_')) {
-    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const targetId = data.slice('hist_view_'.length);
     await ctx.answerCallbackQuery({ text: '📋 Loading history...' });
     return showUserHistory(ctx, targetId);
@@ -1643,7 +1547,7 @@ bot.on('callback_query:data', async ctx => {
 
   // ── Delete user history (from inline button) ── (NEW)
   if (data.startsWith('delh_')) {
-    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const targetId = data.slice('delh_'.length);
     const info = users[String(targetId)];
     const name = info?.username ? `@${info.username}` : info?.first_name || `User ${targetId}`;
@@ -1668,7 +1572,7 @@ bot.on('callback_query:data', async ctx => {
 
   // ── Start convo (from history view button) ── (NEW)
   if (data.startsWith('startconvo_')) {
-    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const targetId = data.slice('startconvo_'.length);
     adminConvoTarget = String(targetId);
     const info = users[String(targetId)];
@@ -1716,7 +1620,7 @@ bot.on('callback_query:data', async ctx => {
 
   // ── Language selection during upload ──
   if (data.startsWith('ul_lang_')) {
-    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const state = adminUploadState.get(userId);
     if (!state) return ctx.answerCallbackQuery({ text: '❌ No active upload session', show_alert: true });
     const lang = data.slice('ul_lang_'.length);
@@ -1732,7 +1636,7 @@ bot.on('callback_query:data', async ctx => {
 
   // ── Quality selection during upload ──
   if (data.startsWith('ul_qual_')) {
-    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const state = adminUploadState.get(userId);
     if (!state) return ctx.answerCallbackQuery({ text: '❌ No active upload session', show_alert: true });
     state.quality = data.slice('ul_qual_'.length);
@@ -1774,7 +1678,7 @@ bot.on('callback_query:data', async ctx => {
 
     try {
       const sent = await ctx.replyWithVideo(m.file_id, { caption, parse_mode: 'Markdown', reply_markup: kb });
-      if (!isAdmin(userId) && chatId) {
+      if (userId !== ADMIN_ID && chatId) {
         scheduleDelete(chatId, sent.message_id);
       }
       return ctx.answerCallbackQuery({ text: `📥 ${m.name} download ho rahi hai!` });
@@ -1802,7 +1706,7 @@ bot.on('callback_query:data', async ctx => {
     const kb = new InlineKeyboard();
     results.forEach(m => {
       kb.text(movieBtnLabel(m), `send_${m.id}`).row();
-      if (isAdmin(userId) && adminEditMode[userId]) {
+      if (userId === ADMIN_ID && adminEditMode[userId]) {
         kb.text(`✏️ Edit`, `edit_${m.id}`).row();
       }
     });
@@ -1830,7 +1734,7 @@ bot.on('callback_query:data', async ctx => {
     logMessage(userId, 'user', `[Request] ${movieName}`);
     await tempReply(ctx, `✅ *Request sent for "${escapeMarkdown(movieName)}"!*\n\nUse /myrequests to track.`, { parse_mode: 'Markdown' });
     try {
-      await bot.api.sendMessage(PRIMARY_ADMIN,
+      await bot.api.sendMessage(ADMIN_ID,
         `📩 *New Request*\n\n🎬 ${escapeMarkdown(movieName)}\n👤 User: ${userId}`,
         { parse_mode: 'Markdown' });
     } catch {}
@@ -1839,7 +1743,7 @@ bot.on('callback_query:data', async ctx => {
 
   // ── Edit movie (admin) ──
   if (data.startsWith('edit_')) {
-    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const mid = data.slice('edit_'.length);
     const m = movies[mid];
     if (!m) return ctx.answerCallbackQuery({ text: '❌ Not found' });
@@ -1853,7 +1757,7 @@ bot.on('callback_query:data', async ctx => {
   }
 
   if (data.startsWith('ef_')) {
-    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const field = data.slice('ef_'.length);
     if (field === 'cancel') {
       delete adminEditState[userId];
@@ -1875,7 +1779,7 @@ bot.on('callback_query:data', async ctx => {
 
   // ── Mark request fulfilled — index-based ──
   if (data.startsWith('rdi_')) {
-    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
 
     const origIdx = parseInt(data.slice('rdi_'.length));
     if (isNaN(origIdx) || origIdx < 0 || origIdx >= requests.length) {
@@ -1960,7 +1864,7 @@ bot.on('callback_query:data', async ctx => {
 
   // ── Legacy req_done_ handler ──
   if (data.startsWith('req_done_')) {
-    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const rest      = data.slice('req_done_'.length);
     const uIdx      = rest.indexOf('_');
     const reqUser   = rest.slice(0, uIdx);
@@ -1998,7 +1902,7 @@ bot.on('callback_query:data', async ctx => {
 
   // ── Post to channel (admin) ──
   if (data.startsWith('post_to_channel_')) {
-    if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const movieId = data.slice('post_to_channel_'.length);
     const m = movies[movieId];
     if (!m) return ctx.answerCallbackQuery({ text: '❌ Movie not found' });

@@ -18,8 +18,14 @@ const OMDB_BASE    = 'https://www.omdbapi.com/';
 const WEBSITE_URL  = 'https://www.compressdocument.in/';
 const INSTAGRAM_URL = 'https://www.instagram.com/_www.compressdocument.in?igsh=MzNtdGVoeHp3YWhq';
 
-if (!BOT_TOKEN)    throw new Error('❌ BOT_TOKEN missing in .env');
-if (!OMDB_API_KEY) throw new Error('❌ OMDB_API_KEY missing in .env');
+// ═══════════════════════════════════════
+// 🗂️ PERSISTENT STORAGE PATH (Fly.io Volume)
+// ═══════════════════════════════════════
+// Set DATA_DIR='/data' on Fly.io, local dev ke liye '.' rakh sakte hain .env mein
+const DATA_DIR = process.env.DATA_DIR || '/data';
+
+if (!BOT_TOKEN)    throw new Error('❌ BOT_TOKEN missing in .env or secrets');
+if (!OMDB_API_KEY) throw new Error('❌ OMDB_API_KEY missing in .env or secrets');
 
 // ═══════════════════════════════════════
 // 📁 IN-MEMORY DATABASE
@@ -37,75 +43,39 @@ let movieCounter   = 1;
 const userLastSearch = new Map();
 
 // ═══════════════════════════════════════
-// 💬 CHAT HISTORY & DIRECT CONVO (NEW)
+// 💬 CHAT HISTORY & DIRECT CONVO
 // ═══════════════════════════════════════
 let chatLogs = {};
-// Structure: { userId: [ { role: 'user'|'bot', text, time } ] }
-
 let adminConvoTarget = null;
-// When set, admin messages relay to this userId and their replies forward to admin
-
-async function loadChatLogs() {
-  chatLogs = await readJSON('chatLogs.json', {});
-}
-async function saveChatLogs() {
-  await writeJSON('chatLogs.json', chatLogs);
-}
-
-/**
- * Log a message in chatLogs
- * @param {string|number} userId
- * @param {'user'|'bot'} role
- * @param {string} text
- */
-function logMessage(userId, role, text) {
-  const uid = String(userId);
-  if (!chatLogs[uid]) chatLogs[uid] = [];
-  chatLogs[uid].push({
-    role,
-    text: String(text || '').slice(0, 500),
-    time: new Date().toISOString()
-  });
-  // Keep last 300 messages per user to avoid bloat
-  if (chatLogs[uid].length > 300) {
-    chatLogs[uid] = chatLogs[uid].slice(-300);
-  }
-  saveChatLogs(); // async but fire-and-forget intentionally
-}
 
 // ═══════════════════════════════════════
 // 📅 DAILY QUEUE
 // ═══════════════════════════════════════
 let dailyQueue = [];
 
-async function loadDailyQueue() {
-  dailyQueue = await readJSON('dailyQueue.json', []);
-}
-async function saveDailyQueue() {
-  await writeJSON('dailyQueue.json', dailyQueue);
-}
-
 // ═══════════════════════════════════════
 // 🔍 FUSE.JS INDEX
 // ═══════════════════════════════════════
 let fuseIndex = null;
-function rebuildFuseIndex() {
-  fuseIndex = new Fuse(Object.values(movies), {
-    keys: ['name'],
-    threshold: 0.4,
-    includeScore: true
-  });
-}
 
 // ═══════════════════════════════════════
-// 💾 DB LOAD / SAVE
+// 🛠️ UTILITIES (file paths with DATA_DIR)
 // ═══════════════════════════════════════
-async function readJSON(file, fallback) {
-  try { return JSON.parse(await fs.readFile(file, 'utf8')); }
-  catch { return fallback; }
+function getFilePath(filename) {
+  return `${DATA_DIR}/${filename}`;
 }
-async function writeJSON(file, data) {
-  await fs.writeFile(file, JSON.stringify(data, null, 2));
+
+async function readJSON(filename, fallback) {
+  try {
+    const data = await fs.readFile(getFilePath(filename), 'utf8');
+    return JSON.parse(data);
+  } catch {
+    return fallback;
+  }
+}
+
+async function writeJSON(filename, data) {
+  await fs.writeFile(getFilePath(filename), JSON.stringify(data, null, 2));
 }
 
 async function loadDB() {
@@ -114,7 +84,7 @@ async function loadDB() {
   users    = await readJSON('users.json', {});
   banned   = await readJSON('banned.json', {});
   await loadDailyQueue();
-  await loadChatLogs(); // ← NEW
+  await loadChatLogs();
 
   let needsMigration = false;
   const newMovies = {};
@@ -141,14 +111,41 @@ async function loadDB() {
   rebuildFuseIndex();
 }
 
-async function saveDB()       { await writeJSON('movies.json', movies); rebuildFuseIndex(); }
-async function saveRequests() { await writeJSON('requests.json', requests); }
-async function saveUsers()    { await writeJSON('users.json', users); }
-async function saveBanned()   { await writeJSON('banned.json', banned); }
+async function saveDB()        { await writeJSON('movies.json', movies); rebuildFuseIndex(); }
+async function saveRequests()  { await writeJSON('requests.json', requests); }
+async function saveUsers()     { await writeJSON('users.json', users); }
+async function saveBanned()    { await writeJSON('banned.json', banned); }
+async function saveChatLogs()  { await writeJSON('chatLogs.json', chatLogs); }
+async function saveDailyQueue(){ await writeJSON('dailyQueue.json', dailyQueue); }
+
+async function loadChatLogs()  { chatLogs = await readJSON('chatLogs.json', {}); }
+async function loadDailyQueue(){ dailyQueue = await readJSON('dailyQueue.json', []); }
+
+function rebuildFuseIndex() {
+  fuseIndex = new Fuse(Object.values(movies), {
+    keys: ['name'],
+    threshold: 0.4,
+    includeScore: true
+  });
+}
 
 // ═══════════════════════════════════════
-// 🛠️ UTILITIES
+// 🟡 Helper: Track & Log (no path change)
 // ═══════════════════════════════════════
+function logMessage(userId, role, text) {
+  const uid = String(userId);
+  if (!chatLogs[uid]) chatLogs[uid] = [];
+  chatLogs[uid].push({
+    role,
+    text: String(text || '').slice(0, 500),
+    time: new Date().toISOString()
+  });
+  if (chatLogs[uid].length > 300) {
+    chatLogs[uid] = chatLogs[uid].slice(-300);
+  }
+  saveChatLogs(); // fire-and-forget
+}
+
 function sanitize(str) {
   if (typeof str !== 'string') return '';
   return str.replace(/[<>]/g, '').trim().slice(0, 200);
@@ -297,7 +294,7 @@ function mergeKeyboards(kb1, kb2) {
 }
 
 // ═══════════════════════════════════════
-// 🎬 OMDB API CALLS
+// 🎬 OMDB API CALLS (unchanged)
 // ═══════════════════════════════════════
 async function fetchOMDb(title) {
   try {
@@ -426,12 +423,9 @@ const KNOWN_LANGUAGES = [
 
 function parseQuery(rawQuery) {
   const query = rawQuery.toLowerCase().trim();
-
   const yearMatch = query.match(/\b(19\d{2}|20\d{2})\b/);
   const year = yearMatch ? yearMatch[0] : null;
-
   let namePart = query.replace(/\b(19\d{2}|20\d{2})\b/, '').trim();
-
   let language = null;
   const sortedLangs = [...KNOWN_LANGUAGES].sort((a, b) => b.length - a.length);
   for (const lang of sortedLangs) {
@@ -442,10 +436,8 @@ function parseQuery(rawQuery) {
       break;
     }
   }
-
   let movieName = namePart.replace(/\s+/g, ' ').trim();
   if (!movieName) movieName = query;
-
   return { movieName, year, language };
 }
 
@@ -455,18 +447,12 @@ function parseQuery(rawQuery) {
 const bot = new Bot(BOT_TOKEN);
 bot.use(session({ initial: () => ({}) }));
 
-// ═══════════════════════════════════════
-// 🧹 Global auto-delete for non-admin user messages (3 minutes)
-// ═══════════════════════════════════════
 bot.use(async (ctx, next) => {
   await next();
-
   const msg = ctx.message;
   if (!msg) return;
-
   const userId = ctx.from?.id;
   if (!userId || userId === ADMIN_ID) return;
-
   setTimeout(() => {
     bot.api.deleteMessage(ctx.chat.id, msg.message_id).catch(() => {});
   }, AUTO_DELETE);
@@ -474,8 +460,6 @@ bot.use(async (ctx, next) => {
 
 bot.use(rateLimit);
 bot.use(banCheck);
-
-loadDB().then(() => console.log('📀 DB loaded'));
 
 // ═══════════════════════════════════════
 // 🛠️ UPLOAD FINISH HELPER
@@ -530,9 +514,7 @@ async function finishUpload(ctx, state) {
         reply_markup: dmKb
       });
 
-      // Log bot message
       logMessage(req.user, 'bot', `[Auto-DM] Movie uploaded: ${state.name}`);
-
       req.status = 'Fulfilled';
       notifiedCount++;
     } catch (e) {
@@ -729,42 +711,29 @@ bot.command('unban', async ctx => {
 });
 
 // ═══════════════════════════════════════
-// 💬 /history — User ki full chat history (NEW)
-// Usage: /history         → All users with history list
-//        /history <userId> → Specific user ki history
+// 💬 /history — User ki full chat history
 // ═══════════════════════════════════════
 bot.command('history', async ctx => {
   if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
-
   const targetId = ctx.message.text.replace('/history', '').trim();
-
-  // ── No userId → Show all users who have history ──
   if (!targetId) {
     const userIds = Object.keys(chatLogs).filter(uid => chatLogs[uid]?.length > 0);
     if (!userIds.length) return ctx.reply('📭 Abhi tak kisi user ki chat history nahi hai.');
-
     let txt = `📋 *Chat History — ${userIds.length} Users*\n\n`;
-
     const kb = new InlineKeyboard();
     userIds.slice(0, 30).forEach((uid, i) => {
       const info = users[uid];
-      const name = info?.username
-        ? `@${info.username}`
-        : info?.first_name || `User ${uid}`;
+      const name = info?.username ? `@${info.username}` : info?.first_name || `User ${uid}`;
       const count = chatLogs[uid]?.length || 0;
       const lastMsg = chatLogs[uid]?.[chatLogs[uid].length - 1];
       const lastTime = lastMsg ? new Date(lastMsg.time).toLocaleDateString('en-IN') : '';
       txt += `${i + 1}\\. 👤 ${escapeMarkdown(name)}\n   🆔 \`${uid}\` | 💬 ${count} msgs | 📅 ${lastTime}\n\n`;
-      // Inline button to view that user's history
       kb.text(`👁️ ${name.slice(0, 18)} (${count})`, `hist_view_${uid}`).row();
     });
-
     txt += `\n💡 _/history <userId> se full history dekho_`;
-
     try {
       await ctx.reply(txt, { parse_mode: 'Markdown', reply_markup: kb });
     } catch {
-      // Fallback plain
       let plain = `Chat History — ${userIds.length} Users\n\n`;
       userIds.slice(0, 30).forEach((uid, i) => {
         const info = users[uid];
@@ -776,28 +745,21 @@ bot.command('history', async ctx => {
     return;
   }
 
-  // ── Specific userId → Show full chat history ──
   await showUserHistory(ctx, targetId);
 });
 
-// Helper: show paginated history for a specific user
 async function showUserHistory(ctx, targetId) {
   const logs = chatLogs[String(targetId)];
   if (!logs || !logs.length) {
     return ctx.reply(`📭 User \`${targetId}\` ki koi chat history nahi hai.`, { parse_mode: 'Markdown' });
   }
-
   const info = users[String(targetId)];
-  const name = info?.username
-    ? `@${info.username}`
-    : info?.first_name || `User ${targetId}`;
-
-  const CHUNK = 15; // messages per page
+  const name = info?.username ? `@${info.username}` : info?.first_name || `User ${targetId}`;
+  const CHUNK = 15;
   const totalPages = Math.ceil(logs.length / CHUNK);
 
   for (let page = 0; page < totalPages; page++) {
     const chunk = logs.slice(page * CHUNK, (page + 1) * CHUNK);
-
     let txt = '';
     if (page === 0) {
       txt += `💬 *Chat History — ${escapeMarkdown(name)}*\n`;
@@ -806,7 +768,6 @@ async function showUserHistory(ctx, targetId) {
     } else {
       txt += `📄 *Page ${page + 1}/${totalPages}*\n\n`;
     }
-
     chunk.forEach(log => {
       const time = new Date(log.time).toLocaleString('en-IN', {
         day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit'
@@ -816,22 +777,15 @@ async function showUserHistory(ctx, targetId) {
       txt += `${icon} *${label}* \\[${escapeMarkdown(time)}\\]\n`;
       txt += `${escapeMarkdown(log.text.slice(0, 300))}\n\n`;
     });
-
-    // Add delete + convo buttons on last page
     let kb = null;
     if (page === totalPages - 1) {
       kb = new InlineKeyboard()
         .text(`🗑️ Delete History`, `delh_${targetId}`)
         .text(`💬 Start Convo`, `startconvo_${targetId}`);
     }
-
     try {
-      await ctx.reply(txt, {
-        parse_mode: 'Markdown',
-        ...(kb ? { reply_markup: kb } : {})
-      });
+      await ctx.reply(txt, { parse_mode: 'Markdown', ...(kb ? { reply_markup: kb } : {}) });
     } catch (e) {
-      // Fallback: plain text
       let plain = `Chat History — ${name} (${targetId})\n\n`;
       chunk.forEach(log => {
         const time = new Date(log.time).toLocaleString('en-IN');
@@ -839,14 +793,12 @@ async function showUserHistory(ctx, targetId) {
       });
       await ctx.reply(plain, { ...(kb ? { reply_markup: kb } : {}) });
     }
-
     if (page < totalPages - 1) await new Promise(r => setTimeout(r, 400));
   }
 }
 
 // ═══════════════════════════════════════
-// 🗑️ /delhistory — Specific user ki history delete karo (NEW)
-// Usage: /delhistory <userId>
+// 🗑️ /delhistory — Specific user ki history delete karo
 // ═══════════════════════════════════════
 bot.command('delhistory', async ctx => {
   if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
@@ -862,17 +814,13 @@ bot.command('delhistory', async ctx => {
   if (!chatLogs[String(targetId)] || chatLogs[String(targetId)].length === 0) {
     return ctx.reply(`❌ User \`${targetId}\` ki koi history nahi mili.`, { parse_mode: 'Markdown' });
   }
-
   const info = users[String(targetId)];
   const name = info?.username ? `@${info.username}` : info?.first_name || `User ${targetId}`;
   const count = chatLogs[String(targetId)].length;
-
-  // Confirm before deleting
   const kb = new InlineKeyboard()
     .text(`✅ Haan, Delete Karo (${count} msgs)`, `delh_${targetId}`)
     .row()
     .text('❌ Cancel', 'noop');
-
   ctx.reply(
     `⚠️ *Confirm Delete?*\n\n` +
     `👤 User: ${escapeMarkdown(name)} \\(${targetId}\\)\n` +
@@ -883,16 +831,11 @@ bot.command('delhistory', async ctx => {
 });
 
 // ═══════════════════════════════════════
-// 💬 /convo — Admin ↔ User direct conversation relay (NEW)
-// Usage: /convo <userId>   → Start relaying with that user
-//        /convo            → Show current convo target
-//        /endconvo         → Stop relay
+// 💬 /convo — Admin ↔ User direct conversation relay
 // ═══════════════════════════════════════
 bot.command('convo', async ctx => {
   if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
-
   const targetId = ctx.message.text.replace('/convo', '').trim();
-
   if (!targetId) {
     if (adminConvoTarget) {
       const info = users[adminConvoTarget];
@@ -921,18 +864,13 @@ bot.command('convo', async ctx => {
       { parse_mode: 'Markdown' }
     );
   }
-
   if (isNaN(Number(targetId))) {
     return ctx.reply('❌ Valid userId dein (sirf numbers).');
   }
-
   const info = users[String(targetId)];
   const name = info?.username ? `@${info.username}` : info?.first_name || `User ${targetId}`;
-
   adminConvoTarget = String(targetId);
-
   const msgCount = chatLogs[String(targetId)]?.length || 0;
-
   await ctx.reply(
     `✅ *Conversation Started!*\n\n` +
     `👤 User: ${escapeMarkdown(name)}\n` +
@@ -944,8 +882,6 @@ bot.command('convo', async ctx => {
     `🛑 /endconvo — baat khatam karein`,
     { parse_mode: 'Markdown' }
   );
-
-  // Notify user that admin wants to talk (optional but good UX)
   try {
     await bot.api.sendMessage(targetId,
       `📣 *CineRadar Admin aapse baat karna chahte hain.*\n\n` +
@@ -961,12 +897,10 @@ bot.command('convo', async ctx => {
 bot.command('endconvo', async ctx => {
   if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
   if (!adminConvoTarget) return ctx.reply('❌ Koi active conversation nahi hai.');
-
   const prev = adminConvoTarget;
   const info = users[prev];
   const name = info?.username ? `@${info.username}` : info?.first_name || `User ${prev}`;
   adminConvoTarget = null;
-
   ctx.reply(
     `🛑 *Conversation Ended*\n\n` +
     `👤 User: ${escapeMarkdown(name)} (${prev})\n\n` +
@@ -980,10 +914,8 @@ bot.command('endconvo', async ctx => {
 // ═══════════════════════════════════════
 bot.command('pending', async ctx => {
   if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
-
   try {
     if (!Array.isArray(requests)) requests = [];
-
     const pend = [];
     for (let i = 0; i < requests.length; i++) {
       const r = requests[i];
@@ -991,42 +923,31 @@ bot.command('pending', async ctx => {
         pend.push({ ...r, _origIdx: i });
       }
     }
-
     if (!pend.length) return ctx.reply('✅ No pending requests.');
-
     const chunkSize = 8;
     const totalPages = Math.ceil(pend.length / chunkSize);
-
     for (let page = 0; page < totalPages; page++) {
       const chunk = pend.slice(page * chunkSize, (page + 1) * chunkSize);
       const startIdx = page * chunkSize;
-
       let txt = page === 0
         ? `📩 *Pending Requests — ${pend.length} total*\n\n`
         : `📋 *Page ${page + 1}/${totalPages}*\n\n`;
-
       const kb = new InlineKeyboard();
-
       for (let i = 0; i < chunk.length; i++) {
         const r = chunk[i];
         const globalIdx = startIdx + i + 1;
-
         const movieName = r.movie || 'Unknown';
         const reqUserId = String(r.user || 'Unknown');
         const reqTime   = r.time ? new Date(r.time).toLocaleDateString('en-IN') : 'N/A';
-
         const userInfo  = users[reqUserId];
         const userName  = userInfo?.username
           ? `@${userInfo.username}`
           : userInfo?.first_name || 'Unknown';
-
         txt += `*${globalIdx}.* 🎬 ${movieName}\n`;
         txt += `   👤 ${userName}  |  🆔 \`${reqUserId}\`\n`;
         txt += `   📅 ${reqTime}\n\n`;
-
         kb.text(`✅ Fulfill #${globalIdx}: ${movieName.slice(0, 20)}`, `rdi_${r._origIdx}`).row();
       }
-
       try {
         await ctx.reply(txt, { parse_mode: 'Markdown', reply_markup: kb });
       } catch (e) {
@@ -1040,7 +961,6 @@ bot.command('pending', async ctx => {
         }
         await ctx.reply(plain, { reply_markup: kb });
       }
-
       if (page < totalPages - 1) await new Promise(r => setTimeout(r, 400));
     }
   } catch (e) {
@@ -1067,7 +987,6 @@ bot.command('search', async ctx => {
 // ═══════════════════════════════════════
 bot.command('dm', async ctx => {
   if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
-
   const args = ctx.message.text.replace('/dm', '').trim();
   if (!args) {
     return ctx.reply(
@@ -1079,22 +998,18 @@ bot.command('dm', async ctx => {
       { parse_mode: 'Markdown' }
     );
   }
-
   const spaceIdx = args.indexOf(' ');
   if (spaceIdx === -1) {
     return ctx.reply('❌ Message likhna zaroori hai.\n\nUsage: /dm <userId> <message>');
   }
-
   const targetId  = args.slice(0, spaceIdx).trim();
   const dmMessage = args.slice(spaceIdx + 1).trim();
-
   if (!targetId || isNaN(Number(targetId))) {
     return ctx.reply('❌ Valid userId dein. (sirf numbers)');
   }
   if (!dmMessage) {
     return ctx.reply('❌ Message empty nahi ho sakta.');
   }
-
   try {
     const userInfo = users[targetId];
     const userLabel = userInfo?.username
@@ -1102,15 +1017,12 @@ bot.command('dm', async ctx => {
       : userInfo?.first_name
         ? userInfo.first_name
         : `User ${targetId}`;
-
     const sentMsg =
       `📣 *CineRadar AI — Admin Message*\n\n` +
       `${escapeMarkdown(dmMessage)}\n\n` +
       `— 👑 CineRadar Admin`;
-
     await bot.api.sendMessage(targetId, sentMsg, { parse_mode: 'Markdown' });
     logMessage(targetId, 'bot', `[/dm] ${dmMessage}`);
-
     return ctx.reply(
       `✅ *Message Successfully Bheja!*\n\n` +
       `👤 To: ${escapeMarkdown(userLabel)} \\(${targetId}\\)\n` +
@@ -1136,12 +1048,10 @@ bot.command('queue_add', async ctx => {
   const type = args[0].toLowerCase();
   if (type !== 'new' && type !== 'upcoming') return ctx.reply('Type must be "new" or "upcoming".');
   const movieName = args.slice(1).join(' ');
-
   const omdb = await fetchOMDb(movieName);
   if (!omdb || !omdb.Poster || omdb.Poster === 'N/A') {
     return ctx.reply('❌ Movie not found on OMDb.');
   }
-
   const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
   let entry = dailyQueue.find(e => e.date === tomorrow);
   if (!entry) {
@@ -1156,7 +1066,6 @@ bot.command('queue_add', async ctx => {
 bot.command('queue_view', async ctx => {
   if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
   if (dailyQueue.length === 0) return ctx.reply('📭 Queue is empty.');
-
   let text = '📋 *Daily Post Queue*\n\n';
   for (const entry of dailyQueue.sort((a, b) => a.date.localeCompare(b.date))) {
     text += `*${entry.date}*\n`;
@@ -1201,7 +1110,6 @@ bot.on('my_chat_member', async ctx => {
   const chatId    = ctx.chat.id;
   const newStatus = ctx.update.my_chat_member.new_chat_member.status;
   const oldStatus = ctx.update.my_chat_member.old_chat_member.status;
-
   if (newStatus === 'member' && oldStatus !== 'member') {
     const helpText =
       `🤖 *CineRadar AI is now active in this group\\!*\n\n` +
@@ -1231,27 +1139,17 @@ bot.on('message', async (ctx, next) => {
   const msg     = ctx.message;
   const userId  = msg.from.id;
   const isAdmin = userId === ADMIN_ID;
-
   trackUser(userId, msg.from.first_name, msg.from.username);
 
-  // ══════════════════════════════════════════════════════
-  // 💬 CONVO RELAY — User → Admin forwarding (NEW)
-  // If this user is the current convo target, forward their
-  // message to admin (even before other checks)
-  // ══════════════════════════════════════════════════════
+  // Convo relay: user → admin
   if (!isAdmin && adminConvoTarget === String(userId)) {
     const info = users[String(userId)];
     const name = info?.username ? `@${info.username}` : info?.first_name || `User ${userId}`;
-
-    // Forward the message content to admin
     if (msg.text && !msg.text.startsWith('/')) {
-      // Log it
       logMessage(userId, 'user', msg.text);
-
       try {
         const kb = new InlineKeyboard()
           .text('🛑 End Conversation', 'endconvo_confirm');
-
         await bot.api.sendMessage(ADMIN_ID,
           `💬 *${escapeMarkdown(name)}* \\(${userId}\\) ka reply:\n\n` +
           `"${escapeMarkdown(msg.text)}"`,
@@ -1271,27 +1169,19 @@ bot.on('message', async (ctx, next) => {
       logMessage(userId, 'user', '[Voice message]');
       await bot.api.sendMessage(ADMIN_ID, `💬 *${escapeMarkdown(name)}* ne voice message bheja.`, { parse_mode: 'Markdown' }).catch(() => {});
     }
-    // Still fall through so user gets normal bot response too
   }
 
-  // ══════════════════════════════════════════════════════
-  // 💬 CONVO RELAY — Admin → User forwarding (NEW)
-  // If admin is in convo mode and sends a plain text message
-  // (not a command), relay it to the target user
-  // ══════════════════════════════════════════════════════
+  // Convo relay: admin → user
   if (isAdmin && adminConvoTarget && msg.text && !msg.text.startsWith('/')) {
     const targetUserId = adminConvoTarget;
     const info = users[targetUserId];
     const name = info?.username ? `@${info.username}` : info?.first_name || `User ${targetUserId}`;
-
     try {
       await bot.api.sendMessage(targetUserId,
         `📣 *CineRadar Admin:*\n\n${escapeMarkdown(msg.text)}`,
         { parse_mode: 'Markdown' }
       );
       logMessage(targetUserId, 'bot', `[Admin Convo] ${msg.text}`);
-
-      // Confirm to admin
       await ctx.reply(
         `✅ *Bhej diya!*\n` +
         `👤 To: ${escapeMarkdown(name)} (${targetUserId})\n\n` +
@@ -1304,10 +1194,10 @@ bot.on('message', async (ctx, next) => {
                      e.message?.includes('not found') ? 'User not found' : e.message;
       await ctx.reply(`❌ Message nahi gaya: ${reason}`);
     }
-    return; // Don't process as regular admin upload / search
+    return;
   }
 
-  // ─── Normal upload flow ───────────────────────────────────
+  // Admin upload flow
   if (isAdmin && (msg.video || msg.document)) {
     const fileId   = msg.video?.file_id   || msg.document?.file_id;
     const fileSize = msg.video?.file_size  || msg.document?.file_size || null;
@@ -1319,7 +1209,6 @@ bot.on('message', async (ctx, next) => {
   if (uploadState && msg.text) {
     const text = sanitize(msg.text);
     if (!text) return;
-
     if (uploadState.step === 'name') {
       uploadState.name = text;
       uploadState.step = 'year';
@@ -1329,14 +1218,14 @@ bot.on('message', async (ctx, next) => {
       uploadState.year = text;
       uploadState.step = 'language';
       const kb = new InlineKeyboard()
-        .text('🇮🇳 Hindi',      'ul_lang_Hindi')
-        .text('🇺🇸 English',    'ul_lang_English').row()
-        .text('🎭 Dual Audio',  'ul_lang_Dual Audio')
+        .text('🇮🇳 Hindi', 'ul_lang_Hindi')
+        .text('🇺🇸 English', 'ul_lang_English').row()
+        .text('🎭 Dual Audio', 'ul_lang_Dual Audio')
         .text('🌍 Multi Audio', 'ul_lang_Multi Audio').row()
-        .text('🎬 Telugu',      'ul_lang_Telugu')
-        .text('🎬 Tamil',       'ul_lang_Tamil').row()
-        .text('🎬 Malayalam',   'ul_lang_Malayalam')
-        .text('🎬 Kannada',     'ul_lang_Kannada');
+        .text('🎬 Telugu', 'ul_lang_Telugu')
+        .text('🎬 Tamil', 'ul_lang_Tamil').row()
+        .text('🎬 Malayalam', 'ul_lang_Malayalam')
+        .text('🎬 Kannada', 'ul_lang_Kannada');
       return ctx.reply('🌐 *Step 3/4:* Select language:', { parse_mode: 'Markdown', reply_markup: kb });
     }
     if (uploadState.step === 'quality') {
@@ -1371,14 +1260,11 @@ bot.on('message', async (ctx, next) => {
   if (msg.text.length < 3) return tempReply(ctx, '⚠️ Please enter at least 3 characters.');
 
   const rawQuery = sanitize(msg.text);
-
-  // ── Log user search message ──
   if (!isAdmin) {
     logMessage(userId, 'user', rawQuery);
   }
 
   const { movieName: parsedName, year: parsedYear, language: parsedLang } = parseQuery(rawQuery);
-
   const query = parsedName.toLowerCase();
   userLastSearch.set(userId, query);
 
@@ -1524,7 +1410,6 @@ bot.on('callback_query:data', async ctx => {
   const userId = ctx.from.id;
   const chatId = ctx.callbackQuery.message?.chat?.id;
 
-  // ── End convo confirm (from inline button) ── (NEW)
   if (data === 'endconvo_confirm') {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     if (!adminConvoTarget) return ctx.answerCallbackQuery({ text: 'No active conversation', show_alert: true });
@@ -1537,7 +1422,6 @@ bot.on('callback_query:data', async ctx => {
     return ctx.answerCallbackQuery({ text: '🛑 Conversation ended' });
   }
 
-  // ── View user history (from /history list button) ── (NEW)
   if (data.startsWith('hist_view_')) {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const targetId = data.slice('hist_view_'.length);
@@ -1545,21 +1429,17 @@ bot.on('callback_query:data', async ctx => {
     return showUserHistory(ctx, targetId);
   }
 
-  // ── Delete user history (from inline button) ── (NEW)
   if (data.startsWith('delh_')) {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const targetId = data.slice('delh_'.length);
     const info = users[String(targetId)];
     const name = info?.username ? `@${info.username}` : info?.first_name || `User ${targetId}`;
     const count = chatLogs[String(targetId)]?.length || 0;
-
     if (!chatLogs[String(targetId)] || count === 0) {
       return ctx.answerCallbackQuery({ text: '❌ History already empty', show_alert: true });
     }
-
     delete chatLogs[String(targetId)];
     await saveChatLogs();
-
     try { await ctx.editMessageReplyMarkup({ reply_markup: new InlineKeyboard().text('✅ History Deleted', 'noop') }); } catch {}
     await ctx.reply(
       `✅ *History Deleted!*\n\n` +
@@ -1570,14 +1450,12 @@ bot.on('callback_query:data', async ctx => {
     return ctx.answerCallbackQuery({ text: `✅ ${count} messages deleted` });
   }
 
-  // ── Start convo (from history view button) ── (NEW)
   if (data.startsWith('startconvo_')) {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const targetId = data.slice('startconvo_'.length);
     adminConvoTarget = String(targetId);
     const info = users[String(targetId)];
     const name = info?.username ? `@${info.username}` : info?.first_name || `User ${targetId}`;
-
     await ctx.reply(
       `✅ *Conversation Started!*\n\n` +
       `👤 User: ${escapeMarkdown(name)} (${targetId})\n\n` +
@@ -1585,7 +1463,6 @@ bot.on('callback_query:data', async ctx => {
       `🛑 /endconvo se band karein.`,
       { parse_mode: 'Markdown' }
     );
-
     try {
       await bot.api.sendMessage(targetId,
         `📣 *CineRadar Admin aapse baat karna chahte hain.*\n\nAap seedha yahan reply kar sakte hain.`,
@@ -1593,32 +1470,25 @@ bot.on('callback_query:data', async ctx => {
       );
       logMessage(targetId, 'bot', '[System] Admin ne conversation start ki');
     } catch {}
-
     return ctx.answerCallbackQuery({ text: '✅ Conversation started!' });
   }
 
-  // ── Website visit confirmation ──
   if (data.startsWith('visit_done_')) {
     const movieId = data.slice('visit_done_'.length);
     markWebsiteVisited(userId);
-
     const m = movies[movieId];
     if (!m) {
       return ctx.answerCallbackQuery({ text: '✅ 3x Fast Download aaj ke liye active ho gayi!', show_alert: true });
     }
-
     const newKb = new InlineKeyboard()
       .url('🌐 Website', WEBSITE_URL).row()
       .url('📷 Instagram Follow Karein (Optional)', INSTAGRAM_URL);
-
     try {
       await ctx.editMessageReplyMarkup({ reply_markup: newKb });
     } catch {}
-
     return ctx.answerCallbackQuery({ text: '✅ 3x Fast Download aaj ke liye active ho gayi! 🚀' });
   }
 
-  // ── Language selection during upload ──
   if (data.startsWith('ul_lang_')) {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const state = adminUploadState.get(userId);
@@ -1634,7 +1504,6 @@ bot.on('callback_query:data', async ctx => {
     return ctx.reply('📺 *Step 4/4:* Select quality:', { parse_mode: 'Markdown', reply_markup: kb });
   }
 
-  // ── Quality selection during upload ──
   if (data.startsWith('ul_qual_')) {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const state = adminUploadState.get(userId);
@@ -1644,21 +1513,15 @@ bot.on('callback_query:data', async ctx => {
     return finishUpload(ctx, state);
   }
 
-  // ── Send movie to user ──
   if (data.startsWith('send_')) {
     const movieId = data.slice('send_'.length);
     const m = movies[movieId];
     if (!m) return ctx.answerCallbackQuery({ text: '❌ Movie not found', show_alert: true });
-
     m.downloads = (m.downloads || 0) + 1;
     if (users[userId]) users[userId].downloads = (users[userId].downloads || 0) + 1;
     saveDB(); saveUsers();
-
-    // Log download action
     logMessage(userId, 'bot', `[Download] ${m.name} (${m.year || '?'})`);
-
     const alreadyFast = hasVisitedWebsiteToday(userId);
-
     const caption =
       `🎬 *${escapeMarkdown(m.name)}* (${m.year || '?'})\n` +
       `🌐 ${m.language || 'N/A'} | 📺 ${m.quality || 'N/A'}${m.size ? ' | ' + fmtSize(m.size) : ''}\n\n` +
@@ -1666,7 +1529,6 @@ bot.on('callback_query:data', async ctx => {
         ? `⚡ *3x Fast Download active hai aaj ke liye!*\n`
         : `💡 *3x Fast Download chahiye? Neeche website visit karein ek baar!*\n`) +
       `⏱️ *Auto-deletes in 3 min — forward & save karein.*`;
-
     const kb = new InlineKeyboard();
     if (!alreadyFast) {
       kb.url('⚡ 3x Fast Download ke liye Website Visit Karein', WEBSITE_URL).row();
@@ -1675,7 +1537,6 @@ bot.on('callback_query:data', async ctx => {
       kb.url('🌐 Website', WEBSITE_URL).row();
     }
     kb.url('📷 Instagram Follow Karein (Optional)', INSTAGRAM_URL);
-
     try {
       const sent = await ctx.replyWithVideo(m.file_id, { caption, parse_mode: 'Markdown', reply_markup: kb });
       if (userId !== ADMIN_ID && chatId) {
@@ -1688,21 +1549,17 @@ bot.on('callback_query:data', async ctx => {
     }
   }
 
-  // ── Filter buttons ──
   if (data.startsWith('f|')) {
     const parts = data.split('|');
     if (parts.length < 4) return ctx.answerCallbackQuery();
     const [, shortQ, type, val] = parts;
     const fullQuery = userLastSearch.get(userId) || shortQ;
-
     let filters = {};
     if (type === 'lang') filters.language = val;
     if (type === 'qual') filters.quality  = val;
     if (type === 'year') filters.year     = val;
-
     const results = type === 'all' ? searchMovies(fullQuery) : searchMovies(fullQuery, filters);
     if (!results.length) return ctx.answerCallbackQuery({ text: 'No results', show_alert: true });
-
     const kb = new InlineKeyboard();
     results.forEach(m => {
       kb.text(movieBtnLabel(m), `send_${m.id}`).row();
@@ -1712,14 +1569,12 @@ bot.on('callback_query:data', async ctx => {
     });
     kb.url('⚡ 3x Fast Download ke liye Website Visit Karein', WEBSITE_URL).row();
     kb.url('📷 Instagram (Optional)', INSTAGRAM_URL);
-
     const fkb = buildFilterKeyboard(fullQuery, results);
     const merged = mergeKeyboards(kb, fkb);
     try { await ctx.editMessageReplyMarkup({ reply_markup: merged }); } catch {}
     return ctx.answerCallbackQuery({ text: `${results.length} result(s)` });
   }
 
-  // ── Movie request ──
   if (data.startsWith('request_')) {
     const movieName = decodeURIComponent(data.slice('request_'.length));
     const already = requests.find(r =>
@@ -1728,7 +1583,6 @@ bot.on('callback_query:data', async ctx => {
       (!r.status || r.status === 'Pending')
     );
     if (already) return ctx.answerCallbackQuery({ text: '⚠️ Already requested!', show_alert: true });
-
     requests.push({ user: userId, movie: movieName, time: new Date().toISOString(), status: 'Pending' });
     await saveRequests();
     logMessage(userId, 'user', `[Request] ${movieName}`);
@@ -1741,7 +1595,6 @@ bot.on('callback_query:data', async ctx => {
     return ctx.answerCallbackQuery({ text: '✅ Request sent!' });
   }
 
-  // ── Edit movie (admin) ──
   if (data.startsWith('edit_')) {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const mid = data.slice('edit_'.length);
@@ -1749,9 +1602,9 @@ bot.on('callback_query:data', async ctx => {
     if (!m) return ctx.answerCallbackQuery({ text: '❌ Not found' });
     adminEditState[userId] = { movieId: mid, step: 'choose_field' };
     const kb = new InlineKeyboard()
-      .text('📝 Name',     'ef_name').text('📅 Year',    'ef_year').row()
+      .text('📝 Name', 'ef_name').text('📅 Year', 'ef_year').row()
       .text('🌐 Language', 'ef_lang').text('📺 Quality', 'ef_qual').row()
-      .text('💾 Size',     'ef_size').text('❌ Cancel',  'ef_cancel');
+      .text('💾 Size', 'ef_size').text('❌ Cancel', 'ef_cancel');
     await ctx.reply(`✏️ Editing: *${escapeMarkdown(m.name)}*\nChoose field:`, { parse_mode: 'Markdown', reply_markup: kb });
     return ctx.answerCallbackQuery();
   }
@@ -1777,29 +1630,22 @@ bot.on('callback_query:data', async ctx => {
     return ctx.answerCallbackQuery();
   }
 
-  // ── Mark request fulfilled — index-based ──
   if (data.startsWith('rdi_')) {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
-
     const origIdx = parseInt(data.slice('rdi_'.length));
     if (isNaN(origIdx) || origIdx < 0 || origIdx >= requests.length) {
       return ctx.answerCallbackQuery({ text: '❌ Request not found (may be deleted)', show_alert: true });
     }
-
     const req = requests[origIdx];
     if (!req) return ctx.answerCallbackQuery({ text: '❌ Request not found', show_alert: true });
     if (req.status === 'Fulfilled') {
       return ctx.answerCallbackQuery({ text: '⚠️ Already fulfilled!', show_alert: true });
     }
-
     const reqUser   = String(req.user);
     const movieName = req.movie;
-
     req.status = 'Fulfilled';
     await saveRequests();
-
     const matchedMovies = searchMovies(movieName);
-
     if (matchedMovies.length === 0) {
       try {
         await bot.api.sendMessage(reqUser,
@@ -1817,7 +1663,6 @@ bot.on('callback_query:data', async ctx => {
         return ctx.answerCallbackQuery({ text: '✅ Marked fulfilled (DM failed — user blocked bot?)' });
       }
     }
-
     const m = matchedMovies[0];
     try {
       const dmCaption =
@@ -1827,22 +1672,18 @@ bot.on('callback_query:data', async ctx => {
         `✅ *Ab aap is movie ko download kar sakte hain!*\n\n` +
         `⚡ *3x Fast Download ke liye website par ek baar visit karein!*\n` +
         `⏱️ *Forward & save kar lo — baad mein bhi kaam aayegi!*`;
-
       const dmKb = new InlineKeyboard()
         .text(`⬇️ Download Karein`, `send_${m.id}`)
         .row()
         .url('⚡ 3x Fast Download ke liye Website Visit Karein', WEBSITE_URL)
         .row()
         .url('📷 Instagram (Optional)', INSTAGRAM_URL);
-
       await bot.api.sendVideo(reqUser, m.file_id, {
         caption: dmCaption,
         parse_mode: 'Markdown',
         reply_markup: dmKb
       });
-
       logMessage(reqUser, 'bot', `[Request Fulfilled] ${m.name} video bheja`);
-
       await ctx.reply(
         `✅ *Request Fulfilled!*\n\n` +
         `🎬 ${escapeMarkdown(m.name)}\n` +
@@ -1850,7 +1691,6 @@ bot.on('callback_query:data', async ctx => {
         `📨 Video DM bhej di gayi!`,
         { parse_mode: 'Markdown' }
       ).catch(() => {});
-
       return ctx.answerCallbackQuery({ text: `✅ ${m.name} — DM bhej di!` });
     } catch (e) {
       console.error('[rdi] DM failed:', e.message);
@@ -1862,7 +1702,6 @@ bot.on('callback_query:data', async ctx => {
     }
   }
 
-  // ── Legacy req_done_ handler ──
   if (data.startsWith('req_done_')) {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const rest      = data.slice('req_done_'.length);
@@ -1900,13 +1739,11 @@ bot.on('callback_query:data', async ctx => {
     return ctx.answerCallbackQuery({ text: '✅ Marked fulfilled' });
   }
 
-  // ── Post to channel (admin) ──
   if (data.startsWith('post_to_channel_')) {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const movieId = data.slice('post_to_channel_'.length);
     const m = movies[movieId];
     if (!m) return ctx.answerCallbackQuery({ text: '❌ Movie not found' });
-
     try {
       await bot.api.sendVideo(CHANNEL, m.file_id, {
         caption:
@@ -1934,26 +1771,22 @@ bot.on('callback_query:data', async ctx => {
 });
 
 // ═══════════════════════════════════════
-// 📅 DAILY AUTO POST
+// 📅 DAILY AUTO POST (uses DATA_DIR)
 // ═══════════════════════════════════════
 const DAILY_FILE = 'lastDailySent.json';
 async function sendDailySuggestions() {
   try {
     let lastDate = '';
-    try { lastDate = (await fs.readFile(DAILY_FILE, 'utf8')).trim(); } catch {}
+    try { lastDate = (await fs.readFile(getFilePath(DAILY_FILE), 'utf8')).trim(); } catch {}
     const today = new Date().toISOString().slice(0, 10);
-
     if (lastDate === today) {
       console.log('[DAILY] Already sent today.');
       return;
     }
-
     console.log('[DAILY] Sending daily post...');
-
     const todayQueue = dailyQueue.find(entry => entry.date === today);
     let newMoviesList      = [];
     let upcomingMoviesList = [];
-
     if (todayQueue && todayQueue.items.length > 0) {
       console.log('[DAILY] Using admin queue for today.');
       newMoviesList      = todayQueue.items.filter(i => i.type === 'new').map(i => i.movieData);
@@ -1963,7 +1796,6 @@ async function sendDailySuggestions() {
       try { newMoviesList      = await getIndianMoviesByType('new', 3);      } catch (e) { console.error('[DAILY] New fetch error:', e); }
       try { upcomingMoviesList = await getIndianMoviesByType('upcoming', 2); } catch (e) { console.error('[DAILY] Upcoming fetch error:', e); }
     }
-
     for (const m of newMoviesList) {
       if (!m.Poster || m.Poster === 'N/A') continue;
       await bot.api.sendPhoto(CHANNEL, m.Poster, {
@@ -1978,7 +1810,6 @@ async function sendDailySuggestions() {
       }).catch(e => console.error('[DAILY] sendPhoto new error:', e.message));
       await new Promise(r => setTimeout(r, 1000));
     }
-
     for (const m of upcomingMoviesList) {
       if (!m.Poster || m.Poster === 'N/A') continue;
       await bot.api.sendPhoto(CHANNEL, m.Poster, {
@@ -1993,7 +1824,6 @@ async function sendDailySuggestions() {
       }).catch(e => console.error('[DAILY] sendPhoto upcoming error:', e.message));
       await new Promise(r => setTimeout(r, 1000));
     }
-
     const list = Object.values(movies);
     if (list.length) {
       const shuffled = [...list].sort(() => Math.random() - 0.5);
@@ -2011,8 +1841,7 @@ async function sendDailySuggestions() {
         await new Promise(r => setTimeout(r, 2000));
       }
     }
-
-    await fs.writeFile(DAILY_FILE, today);
+    await fs.writeFile(getFilePath(DAILY_FILE), today);
     console.log('[DAILY] ✅ Post completed for', today);
   } catch (e) { console.error('[DAILY] Fatal error:', e); }
 }
@@ -2026,7 +1855,7 @@ setTimeout(() => {
 }, 5000);
 
 // ═══════════════════════════════════════
-// 🔄 AUTO GIT PUSH
+// 🔄 AUTO GIT PUSH (optional, keep only if repo is available)
 // ═══════════════════════════════════════
 function gitPush() {
   exec(
@@ -2049,5 +1878,10 @@ bot.catch(err => {
 // ═══════════════════════════════════════
 // 🟢 START
 // ═══════════════════════════════════════
-bot.start({ onStart: info => console.log(`🚀 @${info.username} running — grammY`) });
+loadDB().then(() => console.log('📀 DB loaded')).catch(e => console.error('DB Load error:', e));
 
+bot.start({ onStart: info => console.log(`🚀 @${info.username} running — grammY`) })
+   .catch(err => {
+      console.error('Bot start failed:', err.message);
+      process.exit(1);
+   });

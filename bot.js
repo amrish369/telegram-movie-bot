@@ -29,12 +29,49 @@ let requests = [];
 let users    = {};
 let banned   = {};
 
-const adminUploadState = new Map(); // userId -> upload state
-let adminEditState = {}; // userId -> edit state
-let adminEditMode  = {}; // userId -> boolean
+const adminUploadState = new Map();
+let adminEditState = {};
+let adminEditMode  = {};
 let movieCounter   = 1;
 
 const userLastSearch = new Map();
+
+// ═══════════════════════════════════════
+// 💬 CHAT HISTORY & DIRECT CONVO (NEW)
+// ═══════════════════════════════════════
+let chatLogs = {};
+// Structure: { userId: [ { role: 'user'|'bot', text, time } ] }
+
+let adminConvoTarget = null;
+// When set, admin messages relay to this userId and their replies forward to admin
+
+async function loadChatLogs() {
+  chatLogs = await readJSON('chatLogs.json', {});
+}
+async function saveChatLogs() {
+  await writeJSON('chatLogs.json', chatLogs);
+}
+
+/**
+ * Log a message in chatLogs
+ * @param {string|number} userId
+ * @param {'user'|'bot'} role
+ * @param {string} text
+ */
+function logMessage(userId, role, text) {
+  const uid = String(userId);
+  if (!chatLogs[uid]) chatLogs[uid] = [];
+  chatLogs[uid].push({
+    role,
+    text: String(text || '').slice(0, 500),
+    time: new Date().toISOString()
+  });
+  // Keep last 300 messages per user to avoid bloat
+  if (chatLogs[uid].length > 300) {
+    chatLogs[uid] = chatLogs[uid].slice(-300);
+  }
+  saveChatLogs(); // async but fire-and-forget intentionally
+}
 
 // ═══════════════════════════════════════
 // 📅 DAILY QUEUE
@@ -77,6 +114,7 @@ async function loadDB() {
   users    = await readJSON('users.json', {});
   banned   = await readJSON('banned.json', {});
   await loadDailyQueue();
+  await loadChatLogs(); // ← NEW
 
   let needsMigration = false;
   const newMovies = {};
@@ -460,7 +498,6 @@ async function finishUpload(ctx, state) {
   await saveDB();
   adminUploadState.delete(ctx.from.id);
 
-  // ── AUTO-NOTIFY: Find pending requesters for this movie ──
   const matchedRequesters = requests.filter(r =>
     (!r.status || r.status === 'Pending') &&
     (
@@ -493,6 +530,9 @@ async function finishUpload(ctx, state) {
         reply_markup: dmKb
       });
 
+      // Log bot message
+      logMessage(req.user, 'bot', `[Auto-DM] Movie uploaded: ${state.name}`);
+
       req.status = 'Fulfilled';
       notifiedCount++;
     } catch (e) {
@@ -503,7 +543,6 @@ async function finishUpload(ctx, state) {
 
   if (notifiedCount > 0) await saveRequests();
 
-  // ── Admin confirmation ──
   const caption =
     `✅ *Movie Saved!*\n\n` +
     `🎬 ${escapeMarkdown(state.name)} (${state.year})\n` +
@@ -543,7 +582,11 @@ bot.command('help', async ctx => {
     `⚡ *3x Fast Download:* Website par ek baar visit karein — normal download seedha milega, fast chahiye toh visit karein\n\n` +
     `👑 *Admin only:* /edit, /stats, /broadcast, /delete, /ban, /unban, /pending, /search\n` +
     `               /queue\\_add, /queue\\_view, /queue\\_clear\n` +
-    `               /dm <userId> <message>`;
+    `               /dm <userId> <message>\n` +
+    `               /history [userId] — Chat history dekhein\n` +
+    `               /delhistory <userId> — History delete karein\n` +
+    `               /convo <userId> — Direct baat karein\n` +
+    `               /endconvo — Conversation khatam karein`;
   await tempReply(ctx, helpText, { parse_mode: 'Markdown' });
 });
 
@@ -628,13 +671,15 @@ bot.command('edit', async ctx => {
 bot.command('stats', async ctx => {
   if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
   const totalDL = Object.values(movies).reduce((s, m) => s + (m.downloads || 0), 0);
+  const usersWithHistory = Object.keys(chatLogs).filter(uid => chatLogs[uid]?.length > 0).length;
   ctx.reply(
     `📊 *Bot Statistics*\n\n` +
     `🎬 Movies: ${Object.keys(movies).length}\n` +
     `👥 Users: ${Object.keys(users).length}\n` +
     `⬇️ Total Downloads: ${totalDL}\n` +
     `📩 Pending Requests: ${requests.filter(r => !r.status || r.status === 'Pending').length}\n` +
-    `🚫 Banned: ${Object.keys(banned).length}`,
+    `🚫 Banned: ${Object.keys(banned).length}\n` +
+    `💬 Users with chat history: ${usersWithHistory}`,
     { parse_mode: 'Markdown' });
 });
 
@@ -648,6 +693,7 @@ bot.command('broadcast', async ctx => {
   for (const uid of ids) {
     try {
       await ctx.api.sendMessage(uid, `📢 *Announcement*\n\n${escapeMarkdown(text)}`, { parse_mode: 'Markdown' });
+      logMessage(uid, 'bot', `[Broadcast] ${text}`);
       ok++;
     } catch { fail++; }
     await new Promise(r => setTimeout(r, 50));
@@ -683,7 +729,254 @@ bot.command('unban', async ctx => {
 });
 
 // ═══════════════════════════════════════
-// 📩 /pending — Shows user ID + name, index-based DM buttons
+// 💬 /history — User ki full chat history (NEW)
+// Usage: /history         → All users with history list
+//        /history <userId> → Specific user ki history
+// ═══════════════════════════════════════
+bot.command('history', async ctx => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+
+  const targetId = ctx.message.text.replace('/history', '').trim();
+
+  // ── No userId → Show all users who have history ──
+  if (!targetId) {
+    const userIds = Object.keys(chatLogs).filter(uid => chatLogs[uid]?.length > 0);
+    if (!userIds.length) return ctx.reply('📭 Abhi tak kisi user ki chat history nahi hai.');
+
+    let txt = `📋 *Chat History — ${userIds.length} Users*\n\n`;
+
+    const kb = new InlineKeyboard();
+    userIds.slice(0, 30).forEach((uid, i) => {
+      const info = users[uid];
+      const name = info?.username
+        ? `@${info.username}`
+        : info?.first_name || `User ${uid}`;
+      const count = chatLogs[uid]?.length || 0;
+      const lastMsg = chatLogs[uid]?.[chatLogs[uid].length - 1];
+      const lastTime = lastMsg ? new Date(lastMsg.time).toLocaleDateString('en-IN') : '';
+      txt += `${i + 1}\\. 👤 ${escapeMarkdown(name)}\n   🆔 \`${uid}\` | 💬 ${count} msgs | 📅 ${lastTime}\n\n`;
+      // Inline button to view that user's history
+      kb.text(`👁️ ${name.slice(0, 18)} (${count})`, `hist_view_${uid}`).row();
+    });
+
+    txt += `\n💡 _/history <userId> se full history dekho_`;
+
+    try {
+      await ctx.reply(txt, { parse_mode: 'Markdown', reply_markup: kb });
+    } catch {
+      // Fallback plain
+      let plain = `Chat History — ${userIds.length} Users\n\n`;
+      userIds.slice(0, 30).forEach((uid, i) => {
+        const info = users[uid];
+        const name = info?.first_name || `User ${uid}`;
+        plain += `${i + 1}. ${name} | ID: ${uid} | ${chatLogs[uid]?.length || 0} msgs\n`;
+      });
+      await ctx.reply(plain, { reply_markup: kb });
+    }
+    return;
+  }
+
+  // ── Specific userId → Show full chat history ──
+  await showUserHistory(ctx, targetId);
+});
+
+// Helper: show paginated history for a specific user
+async function showUserHistory(ctx, targetId) {
+  const logs = chatLogs[String(targetId)];
+  if (!logs || !logs.length) {
+    return ctx.reply(`📭 User \`${targetId}\` ki koi chat history nahi hai.`, { parse_mode: 'Markdown' });
+  }
+
+  const info = users[String(targetId)];
+  const name = info?.username
+    ? `@${info.username}`
+    : info?.first_name || `User ${targetId}`;
+
+  const CHUNK = 15; // messages per page
+  const totalPages = Math.ceil(logs.length / CHUNK);
+
+  for (let page = 0; page < totalPages; page++) {
+    const chunk = logs.slice(page * CHUNK, (page + 1) * CHUNK);
+
+    let txt = '';
+    if (page === 0) {
+      txt += `💬 *Chat History — ${escapeMarkdown(name)}*\n`;
+      txt += `🆔 \`${targetId}\` | 📊 Total: ${logs.length} messages\n`;
+      txt += `─────────────────────\n\n`;
+    } else {
+      txt += `📄 *Page ${page + 1}/${totalPages}*\n\n`;
+    }
+
+    chunk.forEach(log => {
+      const time = new Date(log.time).toLocaleString('en-IN', {
+        day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit'
+      });
+      const icon = log.role === 'user' ? '👤' : '🤖';
+      const label = log.role === 'user' ? 'User' : 'Bot';
+      txt += `${icon} *${label}* \\[${escapeMarkdown(time)}\\]\n`;
+      txt += `${escapeMarkdown(log.text.slice(0, 300))}\n\n`;
+    });
+
+    // Add delete + convo buttons on last page
+    let kb = null;
+    if (page === totalPages - 1) {
+      kb = new InlineKeyboard()
+        .text(`🗑️ Delete History`, `delh_${targetId}`)
+        .text(`💬 Start Convo`, `startconvo_${targetId}`);
+    }
+
+    try {
+      await ctx.reply(txt, {
+        parse_mode: 'Markdown',
+        ...(kb ? { reply_markup: kb } : {})
+      });
+    } catch (e) {
+      // Fallback: plain text
+      let plain = `Chat History — ${name} (${targetId})\n\n`;
+      chunk.forEach(log => {
+        const time = new Date(log.time).toLocaleString('en-IN');
+        plain += `[${log.role === 'user' ? 'USER' : 'BOT'}] ${time}\n${log.text.slice(0, 300)}\n\n`;
+      });
+      await ctx.reply(plain, { ...(kb ? { reply_markup: kb } : {}) });
+    }
+
+    if (page < totalPages - 1) await new Promise(r => setTimeout(r, 400));
+  }
+}
+
+// ═══════════════════════════════════════
+// 🗑️ /delhistory — Specific user ki history delete karo (NEW)
+// Usage: /delhistory <userId>
+// ═══════════════════════════════════════
+bot.command('delhistory', async ctx => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  const targetId = ctx.message.text.replace('/delhistory', '').trim();
+  if (!targetId) {
+    return ctx.reply(
+      `🗑️ *Delete Chat History*\n\n` +
+      `Usage: /delhistory <userId>\n\n` +
+      `💡 /history se user IDs dekh sakte hain.`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+  if (!chatLogs[String(targetId)] || chatLogs[String(targetId)].length === 0) {
+    return ctx.reply(`❌ User \`${targetId}\` ki koi history nahi mili.`, { parse_mode: 'Markdown' });
+  }
+
+  const info = users[String(targetId)];
+  const name = info?.username ? `@${info.username}` : info?.first_name || `User ${targetId}`;
+  const count = chatLogs[String(targetId)].length;
+
+  // Confirm before deleting
+  const kb = new InlineKeyboard()
+    .text(`✅ Haan, Delete Karo (${count} msgs)`, `delh_${targetId}`)
+    .row()
+    .text('❌ Cancel', 'noop');
+
+  ctx.reply(
+    `⚠️ *Confirm Delete?*\n\n` +
+    `👤 User: ${escapeMarkdown(name)} \\(${targetId}\\)\n` +
+    `📊 Messages: ${count}\n\n` +
+    `_Yeh action undo nahi ho sakta_`,
+    { parse_mode: 'Markdown', reply_markup: kb }
+  );
+});
+
+// ═══════════════════════════════════════
+// 💬 /convo — Admin ↔ User direct conversation relay (NEW)
+// Usage: /convo <userId>   → Start relaying with that user
+//        /convo            → Show current convo target
+//        /endconvo         → Stop relay
+// ═══════════════════════════════════════
+bot.command('convo', async ctx => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+
+  const targetId = ctx.message.text.replace('/convo', '').trim();
+
+  if (!targetId) {
+    if (adminConvoTarget) {
+      const info = users[adminConvoTarget];
+      const name = info?.username ? `@${info.username}` : info?.first_name || `User ${adminConvoTarget}`;
+      const kb = new InlineKeyboard()
+        .text('🛑 End Conversation', 'endconvo_confirm')
+        .row()
+        .text(`📋 History Dekhein`, `hist_view_${adminConvoTarget}`);
+      return ctx.reply(
+        `💬 *Active Conversation*\n\n` +
+        `👤 User: ${escapeMarkdown(name)}\n` +
+        `🆔 ID: \`${adminConvoTarget}\`\n\n` +
+        `✅ Jo bhi message bhejenge seedha user ko jayega.\n` +
+        `📩 User ke replies yahan forward ho rahe hain.\n\n` +
+        `🛑 /endconvo se band karo`,
+        { parse_mode: 'Markdown', reply_markup: kb }
+      );
+    }
+    return ctx.reply(
+      `💬 *Direct Conversation*\n\n` +
+      `Usage: /convo <userId>\n\n` +
+      `Is feature se aap directly kisi user se baat kar sakte ho:\n` +
+      `• Aapke messages seedha us user ko jayenge\n` +
+      `• User ke replies aapko forward honge\n\n` +
+      `💡 /pending ya /history se user IDs dekho`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  if (isNaN(Number(targetId))) {
+    return ctx.reply('❌ Valid userId dein (sirf numbers).');
+  }
+
+  const info = users[String(targetId)];
+  const name = info?.username ? `@${info.username}` : info?.first_name || `User ${targetId}`;
+
+  adminConvoTarget = String(targetId);
+
+  const msgCount = chatLogs[String(targetId)]?.length || 0;
+
+  await ctx.reply(
+    `✅ *Conversation Started!*\n\n` +
+    `👤 User: ${escapeMarkdown(name)}\n` +
+    `🆔 ID: \`${targetId}\`\n` +
+    `💬 Previous messages: ${msgCount}\n\n` +
+    `📤 Ab jo bhi message bhejoge (commands ke ilawa), seedha is user ko jayega.\n` +
+    `📩 User ke replies yahan real-time forward honge.\n\n` +
+    `📋 /history ${targetId} — purani history dekhein\n` +
+    `🛑 /endconvo — baat khatam karein`,
+    { parse_mode: 'Markdown' }
+  );
+
+  // Notify user that admin wants to talk (optional but good UX)
+  try {
+    await bot.api.sendMessage(targetId,
+      `📣 *CineRadar Admin aapse baat karna chahte hain.*\n\n` +
+      `Aap seedha yahan reply kar sakte hain.`,
+      { parse_mode: 'Markdown' }
+    );
+    logMessage(targetId, 'bot', '[System] Admin ne conversation start ki');
+  } catch (e) {
+    await ctx.reply(`⚠️ User ko notification nahi gayi (blocked/not started bot?)\nLekin aap message kar sakte hain.`);
+  }
+});
+
+bot.command('endconvo', async ctx => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
+  if (!adminConvoTarget) return ctx.reply('❌ Koi active conversation nahi hai.');
+
+  const prev = adminConvoTarget;
+  const info = users[prev];
+  const name = info?.username ? `@${info.username}` : info?.first_name || `User ${prev}`;
+  adminConvoTarget = null;
+
+  ctx.reply(
+    `🛑 *Conversation Ended*\n\n` +
+    `👤 User: ${escapeMarkdown(name)} (${prev})\n\n` +
+    `💡 /history ${prev} se full conversation dekh sakte hain.`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ═══════════════════════════════════════
+// 📩 /pending
 // ═══════════════════════════════════════
 bot.command('pending', async ctx => {
   if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
@@ -691,7 +984,6 @@ bot.command('pending', async ctx => {
   try {
     if (!Array.isArray(requests)) requests = [];
 
-    // Get pending requests WITH their original index in the requests array
     const pend = [];
     for (let i = 0; i < requests.length; i++) {
       const r = requests[i];
@@ -732,14 +1024,12 @@ bot.command('pending', async ctx => {
         txt += `   👤 ${userName}  |  🆔 \`${reqUserId}\`\n`;
         txt += `   📅 ${reqTime}\n\n`;
 
-        // Use original index in requests array — no truncation, 100% match
         kb.text(`✅ Fulfill #${globalIdx}: ${movieName.slice(0, 20)}`, `rdi_${r._origIdx}`).row();
       }
 
       try {
         await ctx.reply(txt, { parse_mode: 'Markdown', reply_markup: kb });
       } catch (e) {
-        // Fallback: plain text if Markdown parsing fails
         let plain = `Pending Requests (${pend.length} total)\n\n`;
         for (let i = 0; i < chunk.length; i++) {
           const r = chunk[i];
@@ -774,7 +1064,6 @@ bot.command('search', async ctx => {
 
 // ═══════════════════════════════════════
 // 💬 /dm — Single user ko message bhejo
-// Usage: /dm <userId> <message>
 // ═══════════════════════════════════════
 bot.command('dm', async ctx => {
   if (ctx.from.id !== ADMIN_ID) return ctx.reply('❌ Admin only.');
@@ -791,7 +1080,6 @@ bot.command('dm', async ctx => {
     );
   }
 
-  // Split: first word = userId, rest = message
   const spaceIdx = args.indexOf(' ');
   if (spaceIdx === -1) {
     return ctx.reply('❌ Message likhna zaroori hai.\n\nUsage: /dm <userId> <message>');
@@ -821,6 +1109,7 @@ bot.command('dm', async ctx => {
       `— 👑 CineRadar Admin`;
 
     await bot.api.sendMessage(targetId, sentMsg, { parse_mode: 'Markdown' });
+    logMessage(targetId, 'bot', `[/dm] ${dmMessage}`);
 
     return ctx.reply(
       `✅ *Message Successfully Bheja!*\n\n` +
@@ -945,6 +1234,80 @@ bot.on('message', async (ctx, next) => {
 
   trackUser(userId, msg.from.first_name, msg.from.username);
 
+  // ══════════════════════════════════════════════════════
+  // 💬 CONVO RELAY — User → Admin forwarding (NEW)
+  // If this user is the current convo target, forward their
+  // message to admin (even before other checks)
+  // ══════════════════════════════════════════════════════
+  if (!isAdmin && adminConvoTarget === String(userId)) {
+    const info = users[String(userId)];
+    const name = info?.username ? `@${info.username}` : info?.first_name || `User ${userId}`;
+
+    // Forward the message content to admin
+    if (msg.text && !msg.text.startsWith('/')) {
+      // Log it
+      logMessage(userId, 'user', msg.text);
+
+      try {
+        const kb = new InlineKeyboard()
+          .text('🛑 End Conversation', 'endconvo_confirm');
+
+        await bot.api.sendMessage(ADMIN_ID,
+          `💬 *${escapeMarkdown(name)}* \\(${userId}\\) ka reply:\n\n` +
+          `"${escapeMarkdown(msg.text)}"`,
+          { parse_mode: 'Markdown', reply_markup: kb }
+        );
+      } catch (e) {
+        console.error('[CONVO RELAY] Forward to admin failed:', e.message);
+      }
+    } else if (msg.sticker) {
+      logMessage(userId, 'user', '[Sticker]');
+      await bot.api.sendMessage(ADMIN_ID, `💬 *${escapeMarkdown(name)}* ne sticker bheja.`, { parse_mode: 'Markdown' }).catch(() => {});
+    } else if (msg.photo) {
+      logMessage(userId, 'user', '[Photo]');
+      const caption = msg.caption ? `: "${msg.caption}"` : '';
+      await bot.api.sendMessage(ADMIN_ID, `💬 *${escapeMarkdown(name)}* ne photo bheja${caption}.`, { parse_mode: 'Markdown' }).catch(() => {});
+    } else if (msg.voice) {
+      logMessage(userId, 'user', '[Voice message]');
+      await bot.api.sendMessage(ADMIN_ID, `💬 *${escapeMarkdown(name)}* ne voice message bheja.`, { parse_mode: 'Markdown' }).catch(() => {});
+    }
+    // Still fall through so user gets normal bot response too
+  }
+
+  // ══════════════════════════════════════════════════════
+  // 💬 CONVO RELAY — Admin → User forwarding (NEW)
+  // If admin is in convo mode and sends a plain text message
+  // (not a command), relay it to the target user
+  // ══════════════════════════════════════════════════════
+  if (isAdmin && adminConvoTarget && msg.text && !msg.text.startsWith('/')) {
+    const targetUserId = adminConvoTarget;
+    const info = users[targetUserId];
+    const name = info?.username ? `@${info.username}` : info?.first_name || `User ${targetUserId}`;
+
+    try {
+      await bot.api.sendMessage(targetUserId,
+        `📣 *CineRadar Admin:*\n\n${escapeMarkdown(msg.text)}`,
+        { parse_mode: 'Markdown' }
+      );
+      logMessage(targetUserId, 'bot', `[Admin Convo] ${msg.text}`);
+
+      // Confirm to admin
+      await ctx.reply(
+        `✅ *Bhej diya!*\n` +
+        `👤 To: ${escapeMarkdown(name)} (${targetUserId})\n\n` +
+        `_/endconvo se conversation band karein_`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (e) {
+      console.error('[CONVO RELAY] Admin→User failed:', e.message);
+      const reason = e.message?.includes('blocked') ? 'User ne bot block kiya' :
+                     e.message?.includes('not found') ? 'User not found' : e.message;
+      await ctx.reply(`❌ Message nahi gaya: ${reason}`);
+    }
+    return; // Don't process as regular admin upload / search
+  }
+
+  // ─── Normal upload flow ───────────────────────────────────
   if (isAdmin && (msg.video || msg.document)) {
     const fileId   = msg.video?.file_id   || msg.document?.file_id;
     const fileSize = msg.video?.file_size  || msg.document?.file_size || null;
@@ -1008,6 +1371,12 @@ bot.on('message', async (ctx, next) => {
   if (msg.text.length < 3) return tempReply(ctx, '⚠️ Please enter at least 3 characters.');
 
   const rawQuery = sanitize(msg.text);
+
+  // ── Log user search message ──
+  if (!isAdmin) {
+    logMessage(userId, 'user', rawQuery);
+  }
+
   const { movieName: parsedName, year: parsedYear, language: parsedLang } = parseQuery(rawQuery);
 
   const query = parsedName.toLowerCase();
@@ -1155,6 +1524,79 @@ bot.on('callback_query:data', async ctx => {
   const userId = ctx.from.id;
   const chatId = ctx.callbackQuery.message?.chat?.id;
 
+  // ── End convo confirm (from inline button) ── (NEW)
+  if (data === 'endconvo_confirm') {
+    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    if (!adminConvoTarget) return ctx.answerCallbackQuery({ text: 'No active conversation', show_alert: true });
+    const prev = adminConvoTarget;
+    const info = users[prev];
+    const name = info?.username ? `@${info.username}` : info?.first_name || `User ${prev}`;
+    adminConvoTarget = null;
+    try { await ctx.editMessageReplyMarkup({ reply_markup: new InlineKeyboard() }); } catch {}
+    await ctx.reply(`🛑 Conversation ended with ${escapeMarkdown(name)} (${prev})`, { parse_mode: 'Markdown' });
+    return ctx.answerCallbackQuery({ text: '🛑 Conversation ended' });
+  }
+
+  // ── View user history (from /history list button) ── (NEW)
+  if (data.startsWith('hist_view_')) {
+    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    const targetId = data.slice('hist_view_'.length);
+    await ctx.answerCallbackQuery({ text: '📋 Loading history...' });
+    return showUserHistory(ctx, targetId);
+  }
+
+  // ── Delete user history (from inline button) ── (NEW)
+  if (data.startsWith('delh_')) {
+    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    const targetId = data.slice('delh_'.length);
+    const info = users[String(targetId)];
+    const name = info?.username ? `@${info.username}` : info?.first_name || `User ${targetId}`;
+    const count = chatLogs[String(targetId)]?.length || 0;
+
+    if (!chatLogs[String(targetId)] || count === 0) {
+      return ctx.answerCallbackQuery({ text: '❌ History already empty', show_alert: true });
+    }
+
+    delete chatLogs[String(targetId)];
+    await saveChatLogs();
+
+    try { await ctx.editMessageReplyMarkup({ reply_markup: new InlineKeyboard().text('✅ History Deleted', 'noop') }); } catch {}
+    await ctx.reply(
+      `✅ *History Deleted!*\n\n` +
+      `👤 User: ${escapeMarkdown(name)} (${targetId})\n` +
+      `🗑️ ${count} messages removed.`,
+      { parse_mode: 'Markdown' }
+    );
+    return ctx.answerCallbackQuery({ text: `✅ ${count} messages deleted` });
+  }
+
+  // ── Start convo (from history view button) ── (NEW)
+  if (data.startsWith('startconvo_')) {
+    if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
+    const targetId = data.slice('startconvo_'.length);
+    adminConvoTarget = String(targetId);
+    const info = users[String(targetId)];
+    const name = info?.username ? `@${info.username}` : info?.first_name || `User ${targetId}`;
+
+    await ctx.reply(
+      `✅ *Conversation Started!*\n\n` +
+      `👤 User: ${escapeMarkdown(name)} (${targetId})\n\n` +
+      `📤 Ab jo bhi message bhejoge, seedha user ko jayega.\n` +
+      `🛑 /endconvo se band karein.`,
+      { parse_mode: 'Markdown' }
+    );
+
+    try {
+      await bot.api.sendMessage(targetId,
+        `📣 *CineRadar Admin aapse baat karna chahte hain.*\n\nAap seedha yahan reply kar sakte hain.`,
+        { parse_mode: 'Markdown' }
+      );
+      logMessage(targetId, 'bot', '[System] Admin ne conversation start ki');
+    } catch {}
+
+    return ctx.answerCallbackQuery({ text: '✅ Conversation started!' });
+  }
+
   // ── Website visit confirmation ──
   if (data.startsWith('visit_done_')) {
     const movieId = data.slice('visit_done_'.length);
@@ -1211,6 +1653,9 @@ bot.on('callback_query:data', async ctx => {
     m.downloads = (m.downloads || 0) + 1;
     if (users[userId]) users[userId].downloads = (users[userId].downloads || 0) + 1;
     saveDB(); saveUsers();
+
+    // Log download action
+    logMessage(userId, 'bot', `[Download] ${m.name} (${m.year || '?'})`);
 
     const alreadyFast = hasVisitedWebsiteToday(userId);
 
@@ -1286,6 +1731,7 @@ bot.on('callback_query:data', async ctx => {
 
     requests.push({ user: userId, movie: movieName, time: new Date().toISOString(), status: 'Pending' });
     await saveRequests();
+    logMessage(userId, 'user', `[Request] ${movieName}`);
     await tempReply(ctx, `✅ *Request sent for "${escapeMarkdown(movieName)}"!*\n\nUse /myrequests to track.`, { parse_mode: 'Markdown' });
     try {
       await bot.api.sendMessage(ADMIN_ID,
@@ -1331,8 +1777,7 @@ bot.on('callback_query:data', async ctx => {
     return ctx.answerCallbackQuery();
   }
 
-  // ── Mark request fulfilled — index-based (rdi_<index>) ──────
-  // Uses requests array index directly: no movie name truncation, 100% match
+  // ── Mark request fulfilled — index-based ──
   if (data.startsWith('rdi_')) {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
 
@@ -1350,15 +1795,12 @@ bot.on('callback_query:data', async ctx => {
     const reqUser   = String(req.user);
     const movieName = req.movie;
 
-    // Mark fulfilled first
     req.status = 'Fulfilled';
     await saveRequests();
 
-    // Try to find movie in DB and send video DM
     const matchedMovies = searchMovies(movieName);
 
     if (matchedMovies.length === 0) {
-      // Movie not in DB yet — just notify user that it will be uploaded soon
       try {
         await bot.api.sendMessage(reqUser,
           `📩 *Aapki Request Update!*\n\n` +
@@ -1368,6 +1810,7 @@ bot.on('callback_query:data', async ctx => {
           `_/myrequests se status track kar sakte hain._`,
           { parse_mode: 'Markdown' }
         );
+        logMessage(reqUser, 'bot', `[Request Update] ${movieName} - Admin dekh liya`);
         return ctx.answerCallbackQuery({ text: '✅ User ko notify kar diya (movie DB mein nahi hai abhi)' });
       } catch (e) {
         console.error('[rdi] notify failed:', e.message);
@@ -1375,7 +1818,6 @@ bot.on('callback_query:data', async ctx => {
       }
     }
 
-    // Movie found — send video directly to user
     const m = matchedMovies[0];
     try {
       const dmCaption =
@@ -1399,7 +1841,8 @@ bot.on('callback_query:data', async ctx => {
         reply_markup: dmKb
       });
 
-      // Also confirm to admin which movie was sent
+      logMessage(reqUser, 'bot', `[Request Fulfilled] ${m.name} video bheja`);
+
       await ctx.reply(
         `✅ *Request Fulfilled!*\n\n` +
         `🎬 ${escapeMarkdown(m.name)}\n` +
@@ -1419,14 +1862,13 @@ bot.on('callback_query:data', async ctx => {
     }
   }
 
-  // ── Legacy req_done_ handler (backward compat, kept for old buttons) ──
+  // ── Legacy req_done_ handler ──
   if (data.startsWith('req_done_')) {
     if (userId !== ADMIN_ID) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const rest      = data.slice('req_done_'.length);
     const uIdx      = rest.indexOf('_');
     const reqUser   = rest.slice(0, uIdx);
     const movieName = decodeURIComponent(rest.slice(uIdx + 1));
-    // Find by user + loose movie name match
     const req = requests.find(r =>
       String(r.user) === String(reqUser) &&
       (!r.status || r.status === 'Pending') &&
@@ -1448,6 +1890,7 @@ bot.on('callback_query:data', async ctx => {
             parse_mode: 'Markdown',
             reply_markup: dmKb
           });
+          logMessage(reqUser, 'bot', `[Legacy Request Fulfilled] ${m.name}`);
           return ctx.answerCallbackQuery({ text: '✅ DM bhej di!' });
         } catch (e) {
           return ctx.answerCallbackQuery({ text: '✅ Fulfilled (DM failed)' });

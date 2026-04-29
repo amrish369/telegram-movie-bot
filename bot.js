@@ -11,6 +11,8 @@ const { exec } = require('child_process');
 const BOT_TOKEN    = process.env.BOT_TOKEN;
 const OMDB_API_KEY = process.env.OMDB_API_KEY;
 const CHANNEL      = process.env.CHANNEL || '@cineradarai';
+const CHANNEL_USERNAME = (process.env.CHANNEL || '@cineradarai').replace('@', ''); // for t.me links
+const BOT_USERNAME = process.env.BOT_USERNAME || 'cineradarai_bot'; // .env mein add karo
 
 // ── MULTI-ADMIN SUPPORT ──────────────────────────────────────
 // .env mein: ADMIN_ID=111111,222222,333333  (comma separated)
@@ -584,6 +586,70 @@ const bot = new Bot(BOT_TOKEN);
 bot.use(session({ initial: () => ({}) }));
 
 // ═══════════════════════════════════════
+// 🔔 FORCE JOIN — Channel membership check
+// Jab tak user channel join nahi karta, bot use nahi kar sakta.
+// Isse "bot blocked/never started" users bhi wapas active ho jaate hain.
+// ═══════════════════════════════════════
+
+/**
+ * Check if user is a member of the channel.
+ * Returns true if member/admin/creator, false otherwise.
+ */
+async function isChannelMember(userId) {
+  try {
+    const member = await bot.api.getChatMember(CHANNEL, userId);
+    return ['member', 'administrator', 'creator'].includes(member.status);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Send force-join prompt to user.
+ */
+async function sendForceJoinMsg(ctx) {
+  const kb = new InlineKeyboard()
+    .url('📢 Channel Join Karein', `https://t.me/${CHANNEL_USERNAME}`)
+    .row()
+    .text('✅ Join Kar Li — Verify', 'verify_join');
+  await ctx.reply(
+    `🔒 *CineRadar AI Use Karne Ke Liye Pehle Channel Join Karein!*\n\n` +
+    `📢 Channel: @${CHANNEL_USERNAME}\n\n` +
+    `Channel join karne ke baad *"✅ Join Kar Li — Verify"* button dabaao.\n\n` +
+    `_Join karne ke fayde:_\n` +
+    `• 🎬 Daily new movies ki update\n` +
+    `• 🗳️ Daily movie debate\n` +
+    `• 📖 Daily bot usage guide\n` +
+    `• ⚡ 3x Fast Download tips`,
+    { parse_mode: 'Markdown', reply_markup: kb }
+  ).catch(() => {});
+}
+
+// ── Auto-accept join requests ──────────────────────────────
+// Jab koi channel/group mein join request bheje → auto approve
+bot.on('chat_join_request', async ctx => {
+  try {
+    await ctx.approveChatJoinRequest(ctx.from.id);
+    // Welcome DM send karo
+    await bot.api.sendMessage(ctx.from.id,
+      `🎉 *Welcome to CineRadar AI!*\n\n` +
+      `✅ Aapki join request accept ho gayi!\n\n` +
+      `🎬 Ab aap bot use kar sakte hain:\n` +
+      `• Movie ka naam type karo\n` +
+      `• /random — random movie\n` +
+      `• /debate — live voting\n` +
+      `• Mood type karo: happy, sad, action...\n\n` +
+      `⚡ *3x Fast Download ke liye website visit karein ek baar!*\n` +
+      `🔗 ${WEBSITE_URL}`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+    console.log(`[JOIN REQUEST] Auto-approved: ${ctx.from.id}`);
+  } catch (e) {
+    console.error('[JOIN REQUEST] Error:', e.message);
+  }
+});
+
+// ═══════════════════════════════════════
 // 🧹 Global auto-delete for non-admin user messages (3 minutes)
 // ═══════════════════════════════════════
 bot.use(async (ctx, next) => {
@@ -602,6 +668,58 @@ bot.use(async (ctx, next) => {
 
 bot.use(rateLimit);
 bot.use(banCheck);
+
+// ═══════════════════════════════════════
+// 🔔 FORCE JOIN MIDDLEWARE
+// Admin aur already-joined users ko pass karo.
+// Baaki sabko channel join karne ke liye kaho.
+// Isse "bot blocked" wale users bhi channel se wapas active hote hain.
+// ═══════════════════════════════════════
+bot.use(async (ctx, next) => {
+  const userId = ctx.from?.id;
+  if (!userId || isAdmin(userId)) return next();
+
+  // Callback queries mein sirf verify_join aur channel join check allow karo
+  if (ctx.callbackQuery) {
+    if (ctx.callbackQuery.data === 'verify_join') {
+      const joined = await isChannelMember(userId);
+      if (joined) {
+        trackUser(userId, ctx.from.first_name, ctx.from.username);
+        try { await ctx.editMessageReplyMarkup({ reply_markup: new InlineKeyboard() }); } catch {}
+        await ctx.reply(
+          `✅ *Verification Successful!*\n\n` +
+          `🎬 Ab aap CineRadar AI use kar sakte hain!\n` +
+          `Movie ka naam type karo ya /help dekho.`,
+          { parse_mode: 'Markdown' }
+        ).catch(() => {});
+        return ctx.answerCallbackQuery({ text: '✅ Verified! Bot use kar sakte hain.' });
+      } else {
+        return ctx.answerCallbackQuery({
+          text: '❌ Aap abhi channel member nahi hain. Pehle join karein!',
+          show_alert: true
+        });
+      }
+    }
+    // Other callbacks — check membership
+    const joined = await isChannelMember(userId);
+    if (!joined) {
+      await sendForceJoinMsg(ctx).catch(() => {});
+      return ctx.answerCallbackQuery({ text: '⚠️ Pehle channel join karein!', show_alert: true });
+    }
+    return next();
+  }
+
+  // Message updates — /start allow karo bina check ke
+  if (ctx.message?.text?.startsWith('/start')) return next();
+
+  // Membership check
+  const joined = await isChannelMember(userId);
+  if (!joined) {
+    return sendForceJoinMsg(ctx);
+  }
+
+  return next();
+});
 
 // ═══════════════════════════════════════
 // 🔒 CONVO MODE INTERCEPTOR MIDDLEWARE
@@ -817,10 +935,50 @@ async function finishUpload(ctx, state) {
 // 🟢 COMMANDS
 // ═══════════════════════════════════════
 bot.command('start', async ctx => {
-  trackUser(ctx.from.id, ctx.from.first_name, ctx.from.username);
+  const userId   = ctx.from.id;
+  const chatType = ctx.chat?.type; // 'private', 'group', 'supergroup', 'channel'
+
+  trackUser(userId, ctx.from.first_name, ctx.from.username);
+
+  // ── Group mein /start → DM karne ko kaho ──
+  if (chatType !== 'private') {
+    const kb = new InlineKeyboard()
+      .url('🤖 Bot DM Mein Start Karein', `https://t.me/${BOT_USERNAME}?start=from_group`);
+    return ctx.reply(
+      `👋 *Namaste!*\n\nBot ko DM mein start karein taaki aap movies download kar sakein aur updates milti rahein!`,
+      { parse_mode: 'Markdown', reply_markup: kb }
+    ).catch(() => {});
+  }
+
+  // ── Private DM start ──
   const safeFirstName = escapeMarkdown(ctx.from.first_name);
+
+  // Check if started from group referral
+  const startParam = ctx.match; // text after /start
+  const fromGroup  = startParam?.includes('from_group') || startParam?.includes('ref');
+
+  if (fromGroup) {
+    await ctx.reply(
+      `✅ *Bot Successfully Start Ho Gaya!*\n\n` +
+      `Ab aapko milega:\n` +
+      `• 📢 Daily movie updates\n` +
+      `• 🎬 Movie download notifications\n` +
+      `• 🗳️ Debate results\n` +
+      `• 📩 Request fulfillment DMs\n\n` +
+      `Ab movie ka naam type karo ya /help dekho 👇`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+  }
+
   await tempAnim(ctx, WELCOME_GIF, {
-    caption: `🎬 *Welcome to CineRadar AI, ${safeFirstName}\\!*\n\n🔍 Type movie name \\(min 3 chars\\) to search\\.\n⏱️ Messages auto\\-delete in 3 minutes\\. Forward and save\\.\n⚡ *3x Fast Download ke liye website par ek baar visit karein\\!*`,
+    caption:
+      `🎬 *Welcome to CineRadar AI, ${safeFirstName}\\!*\n\n` +
+      `🔍 Movie ka naam type karo \\(min 3 chars\\)\n` +
+      `🎭 Mood type karo: happy, sad, action\\.\\.\\.\n` +
+      `🎲 /random — Random movie\n` +
+      `🗳️ /debate — Live movie vote\n\n` +
+      `⏱️ Messages auto\\-delete in 3 min\\. Forward & save\\.\n` +
+      `⚡ *3x Fast Download ke liye website visit karein\\!*`,
     parse_mode: 'MarkdownV2'
   });
 });
@@ -1709,7 +1867,43 @@ bot.on('message', async (ctx, next) => {
   trackUser(userId, msg.from.first_name, msg.from.username);
 
   // ══════════════════════════════════════════════════════
-  // 💬 CONVO RELAY — Admin → User forwarding
+  // 🤖 BOT START NUDGE — Group users jo DM start nahi kiye
+  // In users ko broadcast/DM nahi milta. Fix: unhe ek baar
+  // "Start Bot" button dikhao taaki woh users[] mein properly
+  // register ho jayein aur DMs milne lagein.
+  // ══════════════════════════════════════════════════════
+  const chatType = ctx.chat?.type;
+  if (!isAdmin && chatType && chatType !== 'private') {
+    const userRecord = users[String(userId)];
+    const alreadyStarted = userRecord?.bot_started;
+    const lastPrompt     = userRecord?.bot_start_prompted;
+    // Sirf tab prompt karo: bot start nahi kiya AND (pehle prompt nahi diya ya 24 ghante se zyada ho gaye)
+    const needsPrompt = !alreadyStarted && (
+      !lastPrompt || (Date.now() - new Date(lastPrompt).getTime() > 24 * 60 * 60 * 1000)
+    );
+    if (needsPrompt) {
+      const startKb = new InlineKeyboard()
+        .url('🤖 Bot DM Mein Start Karein (Zaroori!)', `https://t.me/${BOT_USERNAME}?start=from_group`);
+      ctx.reply(
+        `👋 *${escapeMarkdown(msg.from.first_name)}*, bot ko DM mein ek baar start karo!\n\n` +
+        `📩 Tabhi aapko movies, notifications aur downloads milenge.\n` +
+        `⬇️ Neeche button dabao:`,
+        { parse_mode: 'Markdown', reply_markup: startKb }
+      ).catch(() => {});
+      if (users[String(userId)]) {
+        users[String(userId)].bot_start_prompted = new Date().toISOString();
+        saveUsers();
+      }
+    }
+  }
+
+  // Mark user as bot_started when they message in private
+  if (!isAdmin && chatType === 'private' && users[String(userId)] && !users[String(userId)].bot_started) {
+    users[String(userId)].bot_started = true;
+    saveUsers();
+  }
+
+
   // If admin is in convo mode and sends a plain text message
   // (not a command), relay it to the target user
   // ══════════════════════════════════════════════════════
@@ -1984,6 +2178,63 @@ bot.on('callback_query:data', async ctx => {
   const data   = ctx.callbackQuery.data;
   const userId = ctx.from.id;
   const chatId = ctx.callbackQuery.message?.chat?.id;
+
+  // ── 🗳️ Daily Debate vote (channel post) ──
+  // ddebate_1_<movieId> and ddebate_2_<movieId>
+  if (data.startsWith('ddebate_1_') || data.startsWith('ddebate_2_')) {
+    const choice  = data.startsWith('ddebate_1_') ? 1 : 2;
+    const movieId = data.startsWith('ddebate_1_') ? data.slice('ddebate_1_'.length) : data.slice('ddebate_2_'.length);
+    const today   = new Date().toISOString().slice(0, 10);
+    const pollKey = `daily_${today}`;
+    const poll    = debatePolls.get(pollKey);
+
+    if (!poll) {
+      return ctx.answerCallbackQuery({ text: '⏰ Aaj ka debate khatam ya expired ho gaya!', show_alert: true });
+    }
+
+    const prevVote = poll.votes[userId];
+    if (prevVote === choice) {
+      return ctx.answerCallbackQuery({ text: '✅ Tumne pehle se yahi vote diya hai!', show_alert: false });
+    }
+
+    poll.votes[userId] = choice;
+
+    const v1    = Object.values(poll.votes).filter(v => v === 1).length;
+    const v2    = Object.values(poll.votes).filter(v => v === 2).length;
+    const total = v1 + v2;
+    const bar1  = total ? Math.round((v1 / total) * 10) : 0;
+    const bar2  = total ? Math.round((v2 / total) * 10) : 0;
+
+    // Update channel message with live vote counts
+    const updatedTxt =
+      `🗳️ *Aaj Ka Movie Debate!*\n\n` +
+      `1️⃣ *${escapeMarkdown(poll.movie1.name)}* (${poll.movie1.year || '?'})\n` +
+      `🌐 ${poll.movie1.language || 'N/A'} | 📺 ${poll.movie1.quality || 'N/A'}\n` +
+      `${'🟩'.repeat(bar1)}${'⬜'.repeat(10 - bar1)} ${v1} votes\n\n` +
+      `vs\n\n` +
+      `2️⃣ *${escapeMarkdown(poll.movie2.name)}* (${poll.movie2.year || '?'})\n` +
+      `🌐 ${poll.movie2.language || 'N/A'} | 📺 ${poll.movie2.quality || 'N/A'}\n` +
+      `${'🟦'.repeat(bar2)}${'⬜'.repeat(10 - bar2)} ${v2} votes\n\n` +
+      `👥 *Total votes: ${total}* | 📅 ${new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'long' })}\n` +
+      `👇 *Vote karo — Kaun behtar hai?*`;
+
+    const updatedKb = new InlineKeyboard()
+      .text(`1️⃣ ${poll.movie1.name.slice(0, 22)} (${v1})`, `ddebate_1_${poll.movie1.id}`)
+      .text(`2️⃣ ${poll.movie2.name.slice(0, 22)} (${v2})`, `ddebate_2_${poll.movie2.id}`)
+      .row()
+      .url('⚡ Website Visit Karein', WEBSITE_URL)
+      .url(`🤖 Bot: @${BOT_USERNAME}`, `https://t.me/${BOT_USERNAME}`);
+
+    try {
+      await ctx.editMessageText(updatedTxt, { parse_mode: 'Markdown', reply_markup: updatedKb });
+    } catch {}
+
+    const votedName = choice === 1 ? poll.movie1.name : poll.movie2.name;
+    return ctx.answerCallbackQuery({
+      text: `${prevVote ? '🔄 Vote badal diya!' : '✅ Vote diya!'} — ${votedName.slice(0, 30)}`,
+      show_alert: false
+    });
+  }
 
   // ── 🎲 Random movie callback ──
   if (data === 'rand_any') {
@@ -2473,6 +2724,34 @@ bot.on('callback_query:data', async ctx => {
 // 📅 DAILY AUTO POST
 // ═══════════════════════════════════════
 const DAILY_FILE = 'lastDailySent.json';
+
+// ── Daily Guide Text ──────────────────────────────────────
+function getDailyGuideText(date) {
+  const day = new Date(date).toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long' });
+  return (
+    `📖 *CineRadar AI — Daily Guide*\n` +
+    `📅 ${day}\n` +
+    `${'─'.repeat(28)}\n\n` +
+    `🎬 *Movie Kaise Dhundein?*\n` +
+    `Sirf movie ka naam type karo bot mein\n` +
+    `Example: _Pathaan_, _KGF_, _RRR_\n\n` +
+    `🎭 *Mood Se Movie:*\n` +
+    `Type karo: \`happy\` \`sad\` \`action\` \`scary\`\n` +
+    `\`romantic\` \`funny\` \`chill\` \`mystery\`\n` +
+    `Ya emoji bhejo: 😄 😢 💥 😱 ❤️ 😂 😌 🔍\n\n` +
+    `🎲 *Random Movie:* /random\n` +
+    `🗳️ *Daily Debate:* /debate\n` +
+    `📩 *Movie Request:* Search karo → Request button\n` +
+    `📋 *My Requests:* /myrequests\n\n` +
+    `${'─'.repeat(28)}\n` +
+    `⚡ *3x Fast Download:*\n` +
+    `Website ek baar visit karo → 3x speed milegi\n` +
+    `🔗 ${WEBSITE_URL}\n\n` +
+    `📢 *Channel:* @${CHANNEL_USERNAME}\n` +
+    `💬 *Bot:* @${BOT_USERNAME}`
+  );
+}
+
 async function sendDailySuggestions() {
   try {
     let lastDate = '';
@@ -2500,6 +2779,7 @@ async function sendDailySuggestions() {
       try { upcomingMoviesList = await getIndianMoviesByType('upcoming', 2); } catch (e) { console.error('[DAILY] Upcoming fetch error:', e); }
     }
 
+    // ── 1. New releases ──
     for (const m of newMoviesList) {
       if (!m.Poster || m.Poster === 'N/A') continue;
       await bot.api.sendPhoto(CHANNEL, m.Poster, {
@@ -2508,13 +2788,14 @@ async function sendDailySuggestions() {
           `🎬 ${escapeMarkdown(m.Title)} (${m.Year})\n` +
           `⭐ IMDb: ${m.imdbRating || 'N/A'}\n` +
           `📖 ${escapeMarkdown(m.Plot || '')}\n\n` +
-          `📥 Search on bot to request!\n` +
-          `⚡ *3x Fast Download ke liye website par ek baar visit karein!*`,
+          `📥 Bot mein search karo!\n` +
+          `⚡ *3x Fast Download ke liye website visit karein!*`,
         parse_mode: 'Markdown'
       }).catch(e => console.error('[DAILY] sendPhoto new error:', e.message));
       await new Promise(r => setTimeout(r, 1000));
     }
 
+    // ── 2. Upcoming movies ──
     for (const m of upcomingMoviesList) {
       if (!m.Poster || m.Poster === 'N/A') continue;
       await bot.api.sendPhoto(CHANNEL, m.Poster, {
@@ -2523,13 +2804,14 @@ async function sendDailySuggestions() {
           `🎬 ${escapeMarkdown(m.Title)} (${m.Year})\n` +
           `⭐ IMDb: ${m.imdbRating || 'N/A'}\n` +
           `📖 ${escapeMarkdown(m.Plot || '')}\n\n` +
-          `📥 Search on bot to request!\n` +
-          `⚡ *3x Fast Download ke liye website par ek baar visit karein!*`,
+          `📥 Bot mein search karo!\n` +
+          `⚡ *3x Fast Download ke liye website visit karein!*`,
         parse_mode: 'Markdown'
       }).catch(e => console.error('[DAILY] sendPhoto upcoming error:', e.message));
       await new Promise(r => setTimeout(r, 1000));
     }
 
+    // ── 3. Daily movie suggestions ──
     const list = Object.values(movies);
     if (list.length) {
       const shuffled = [...list].sort(() => Math.random() - 0.5);
@@ -2540,16 +2822,114 @@ async function sendDailySuggestions() {
             `🎬 *Today's Suggestion*\n\n` +
             `${escapeMarkdown(m.name)} (${m.year || '?'})\n` +
             `🌐 ${m.language || 'N/A'} | 📺 ${m.quality || 'N/A'}${m.size ? ' | ' + fmtSize(m.size) : ''}\n\n` +
-            `📥 Download using the bot!\n` +
-            `⚡ *3x Fast Download ke liye website par ek baar visit karein!*`,
+            `📥 Bot se download karo!\n` +
+            `⚡ *3x Fast Download ke liye website visit karein!*`,
           parse_mode: 'Markdown'
         }).catch(e => console.error('[DAILY] sendVideo error:', e.message));
         await new Promise(r => setTimeout(r, 2000));
       }
     }
 
+    // ── 4. Daily Debate — permanent, pinned at bottom ──
+    if (list.length >= 2) {
+      try {
+        const shuffledDebate = [...list].sort(() => Math.random() - 0.5);
+        const [dm1, dm2] = shuffledDebate;
+        const DEBATE_DURATION = 24 * 60 * 60; // 24 hours for daily debate
+
+        const debateTxt =
+          `🗳️ *Aaj Ka Movie Debate!*\n\n` +
+          `1️⃣ *${escapeMarkdown(dm1.name)}* (${dm1.year || '?'})\n` +
+          `🌐 ${dm1.language || 'N/A'} | 📺 ${dm1.quality || 'N/A'}\n\n` +
+          `vs\n\n` +
+          `2️⃣ *${escapeMarkdown(dm2.name)}* (${dm2.year || '?'})\n` +
+          `🌐 ${dm2.language || 'N/A'} | 📺 ${dm2.quality || 'N/A'}\n\n` +
+          `👇 *Vote karo — Kaun behtar hai?*\n` +
+          `📅 ${new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'long' })}`;
+
+        const debateKb = new InlineKeyboard()
+          .text(`1️⃣ ${dm1.name.slice(0, 25)}`, `ddebate_1_${dm1.id}`)
+          .text(`2️⃣ ${dm2.name.slice(0, 25)}`, `ddebate_2_${dm2.id}`)
+          .row()
+          .url('⚡ Website Visit Karein', WEBSITE_URL)
+          .url(`🤖 Bot: @${BOT_USERNAME}`, `https://t.me/${BOT_USERNAME}`);
+
+        const debateSent = await bot.api.sendMessage(CHANNEL, debateTxt, {
+          parse_mode: 'Markdown',
+          reply_markup: debateKb
+        });
+
+        // Pin the debate post so it stays at bottom / visible
+        await bot.api.pinChatMessage(CHANNEL, debateSent.message_id, {
+          disable_notification: true // silent pin — no notification spam
+        }).catch(e => console.error('[DAILY] Pin debate failed:', e.message));
+
+        // Store daily debate poll (24h)
+        debatePolls.set(`daily_${today}`, {
+          msgId: debateSent.message_id,
+          chatId: CHANNEL,
+          movie1: dm1,
+          movie2: dm2,
+          votes: {},
+          isDaily: true,
+          endTime: Date.now() + DEBATE_DURATION * 1000
+        });
+
+        console.log('[DAILY] ✅ Debate posted & pinned');
+      } catch (e) {
+        console.error('[DAILY] Debate post error:', e.message);
+      }
+    }
+
+    // ── 5. Daily Guide — bot usage guide, pinned at very bottom ──
+    try {
+      const guideKb = new InlineKeyboard()
+        .url(`🤖 Bot Start Karein`, `https://t.me/${BOT_USERNAME}?start=guide`)
+        .row()
+        .url('⚡ 3x Fast Download Website', WEBSITE_URL)
+        .row()
+        .url('📷 Instagram Follow Karein', INSTAGRAM_URL);
+
+      const guideSent = await bot.api.sendMessage(CHANNEL, getDailyGuideText(today), {
+        parse_mode: 'Markdown',
+        reply_markup: guideKb
+      });
+
+      // Pin guide AFTER debate — it becomes the bottommost pinned message
+      await bot.api.pinChatMessage(CHANNEL, guideSent.message_id, {
+        disable_notification: true
+      }).catch(e => console.error('[DAILY] Pin guide failed:', e.message));
+
+      console.log('[DAILY] ✅ Guide posted & pinned');
+    } catch (e) {
+      console.error('[DAILY] Guide post error:', e.message);
+    }
+
+    // ── 6. Broadcast to all users — "new posts available" notification ──
+    const allUserIds = Object.keys(users);
+    let broadcastOk = 0, broadcastFail = 0;
+    const broadcastMsg =
+      `🎬 *CineRadar AI — Aaj Ki Updates!*\n\n` +
+      `✅ Naye movies suggest kiye gaye\n` +
+      `🗳️ Aaj ka debate shuru ho gaya\n` +
+      `📖 Daily guide available hai\n\n` +
+      `👉 Channel dekho: @${CHANNEL_USERNAME}\n` +
+      `🤖 Bot use karo: @${BOT_USERNAME}\n\n` +
+      `⚡ *3x Fast Download:* ${WEBSITE_URL}`;
+
+    for (const uid of allUserIds) {
+      try {
+        await bot.api.sendMessage(uid, broadcastMsg, { parse_mode: 'Markdown' });
+        broadcastOk++;
+      } catch {
+        broadcastFail++;
+      }
+      await new Promise(r => setTimeout(r, 60)); // rate limit
+    }
+    console.log(`[DAILY] Broadcast: ✅ ${broadcastOk} | ❌ ${broadcastFail}`);
+
     await fs.writeFile(DAILY_FILE, today);
-    console.log('[DAILY] ✅ Post completed for', today);
+    console.log('[DAILY] ✅ All daily posts completed for', today);
   } catch (e) { console.error('[DAILY] Fatal error:', e); }
 }
 

@@ -510,10 +510,10 @@
     "first_name": "Video",
     "username": "",
     "first_seen": "2026-04-11T09:02:39.602Z",
-    "last_seen": "2026-04-28T20:17:15.336Z",
-    "search_count": 201,
-    "downloads": 34,
-    "lastWebsiteVisit": "2026-04-19T05:32:44.300Z"
+    "last_seen": "2026-04-29T01:25:21.380Z",
+    "search_count": 210,
+    "downloads": 36,
+    "lastWebsiteVisit": "2026-04-28T20:47:22.922Z"
   },
   "7891157539": {
     "id": 7891157539,
@@ -1507,9 +1507,10 @@
     "first_name": "A",
     "username": "",
     "first_seen": "2026-04-27T08:51:46.288Z",
-    "last_seen": "2026-04-28T14:58:48.571Z",
-    "search_count": 7,
-    "downloads": 4
+    "last_seen": "2026-04-29T01:25:50.529Z",
+    "search_count": 10,
+    "downloads": 4,
+    "bot_started": true
   },
   "6656503357": {
     "id": 6656503357,
@@ -1657,5 +1658,15 @@
     "last_seen": "2026-04-28T19:45:10.172Z",
     "search_count": 1,
     "downloads": 0
+  },
+  "8647894904": {
+    "id": 8647894904,
+    "first_name": "Cineradar",
+    "username": "Cinedbot",
+    "first_seen": "2026-04-29T01:10:37.365Z",
+    "last_seen": "2026-04-29T01:10:37.365Z",
+    "search_count": 0,
+    "downloads": 0,
+    "bot_start_prompted": "2026-04-29T01:10:37.377Z"
   }
 }

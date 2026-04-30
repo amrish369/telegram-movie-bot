@@ -8,11 +8,11 @@ const { exec } = require('child_process');
 // ═══════════════════════════════════════
 // 🔐 CONFIG
 // ═══════════════════════════════════════
-const BOT_TOKEN    = process.env.BOT_TOKEN;
-const OMDB_API_KEY = process.env.OMDB_API_KEY;
-const CHANNEL      = process.env.CHANNEL || '@cineradarai';
-const CHANNEL_USERNAME = (process.env.CHANNEL || '@cineradarai').replace('@', ''); // for t.me links
-const BOT_USERNAME = process.env.BOT_USERNAME || 'cineradarai_bot'; // .env mein add karo
+const BOT_TOKEN      = process.env.BOT_TOKEN;
+const TMDB_API_KEY   = process.env.TMDB_API_KEY;
+const CHANNEL        = process.env.CHANNEL || '@cineradarai';
+const CHANNEL_USERNAME = (process.env.CHANNEL || '@cineradarai').replace('@', '');
+const BOT_USERNAME   = process.env.BOT_USERNAME || 'cineradarai_bot';
 
 // ── MULTI-ADMIN SUPPORT ──────────────────────────────────────
 // .env mein: ADMIN_ID=111111,222222,333333  (comma separated)
@@ -26,14 +26,14 @@ const ADMIN_IDS = new Set(
 const PRIMARY_ADMIN = [...ADMIN_IDS][0];
 function isAdmin(id) { return ADMIN_IDS.has(Number(id)); }
 // ────────────────────────────────────────────────────────────
-const AUTO_DELETE  = 3 * 60 * 1000;
-const WELCOME_GIF  = 'https://media.tenor.com/8d9B7xYkZk0AAAAC/welcome.gif';
-const OMDB_BASE    = 'https://www.omdbapi.com/';
-const WEBSITE_URL  = 'https://www.compressdocument.in/';
-const INSTAGRAM_URL = 'https://www.instagram.com/_www.compressdocument.in?igsh=MzNtdGVoeHp3YWhq';
+const AUTO_DELETE    = 3 * 60 * 1000;
+const TMDB_BASE      = 'https://api.themoviedb.org/3';
+const TMDB_IMG       = 'https://image.tmdb.org/t/p/w500';
+const WEBSITE_URL    = 'https://www.compressdocument.in/';
+const INSTAGRAM_URL  = 'https://www.instagram.com/_www.compressdocument.in?igsh=MzNtdGVoeHp3YWhq';
 
 if (!BOT_TOKEN)    throw new Error('❌ BOT_TOKEN missing in .env');
-if (!OMDB_API_KEY) throw new Error('❌ OMDB_API_KEY missing in .env');
+if (!TMDB_API_KEY) throw new Error('❌ TMDB_API_KEY missing in .env');
 // ═══════════════════════════════════════
 // 🎭 MOOD MAP — keywords + emojis → genre tags
 // ═══════════════════════════════════════
@@ -97,6 +97,7 @@ let chatLogs = {};
 // Structure: { userId: [ { role: 'user'|'bot', text, time } ] }
 
 let adminConvoTarget = null;
+let adminConvoStartedBy = null; // jo admin ne /convo shuru kiya uska ID
 // When set, admin messages relay to this userId and their replies forward to admin
 
 async function loadChatLogs() {
@@ -121,25 +122,25 @@ async function saveGenreCache() {
 }
 
 /**
- * Ek movie ka genre OMDB se fetch karo (cache-first).
+ * Ek movie ka genre TMDB se fetch karo (cache-first).
  * Returns genre string like "Action, Drama, Thriller" or null.
  */
 async function fetchGenreForMovie(movie) {
   if (!movie?.id) return null;
-  // Cache hit
   if (genreCache[movie.id]?.genre) return genreCache[movie.id].genre;
 
   try {
-    const data = await fetchOMDb(movie.name);
-    if (data && data.Genre && data.Genre !== 'N/A') {
+    const data = await fetchTMDBByTitle(movie.name);
+    if (data?.genres?.length) {
+      const genreStr = data.genres.map(g => g.name).join(', ');
       genreCache[movie.id] = {
-        genre:   data.Genre,
-        plot:    data.Plot !== 'N/A' ? data.Plot : '',
-        rating:  data.imdbRating !== 'N/A' ? data.imdbRating : '',
+        genre:   genreStr,
+        plot:    data.overview || '',
+        rating:  data.vote_average ? String(data.vote_average.toFixed(1)) : '',
         fetched: new Date().toISOString()
       };
-      saveGenreCache(); // fire-and-forget
-      return data.Genre;
+      saveGenreCache();
+      return genreStr;
     }
   } catch (e) {
     console.error('[GENRE CACHE]', e.message);
@@ -148,25 +149,20 @@ async function fetchGenreForMovie(movie) {
 }
 
 /**
- * Mood ke liye OMDB genre se movies filter karo.
- * Sirf un movies ko fetch karta hai jinka cache missing ho.
- * Returns filtered movie list (empty array if nothing matches).
+ * Mood ke liye TMDB genre se movies filter karo.
  */
 async function filterMoviesByMood(movieList, mood) {
   if (!mood || !MOOD_MAP[mood]) return movieList;
-  const moodKeywords = MOOD_MAP[mood].keywords; // e.g. ['horror','thriller','ghost']
+  const moodKeywords = MOOD_MAP[mood].keywords;
 
   const matched = [];
 
-  // Process movies — cache miss waale batchwise OMDB se fetch karo
-  // Rate limit: 200ms gap between OMDB calls
   for (const movie of movieList) {
     let genre = genreCache[movie.id]?.genre || null;
 
     if (!genre) {
-      // Cache miss — OMDB se fetch karo
       genre = await fetchGenreForMovie(movie);
-      await new Promise(r => setTimeout(r, 200)); // rate limit
+      await new Promise(r => setTimeout(r, 200));
     }
 
     if (genre) {
@@ -244,7 +240,8 @@ async function loadDB() {
   banned   = await readJSON('banned.json', {});
   await loadDailyQueue();
   await loadChatLogs();
-  await loadGenreCache(); // ← genre cache for mood search
+  await loadGenreCache();
+  await loadPostedMovies(); // ← TMDB posted tracker
 
   let needsMigration = false;
   const newMovies = {};
@@ -426,71 +423,191 @@ function mergeKeyboards(kb1, kb2) {
   return merged;
 }
 
+
 // ═══════════════════════════════════════
-// 🎬 OMDB API CALLS
+// 🎬 TMDB API FUNCTIONS
 // ═══════════════════════════════════════
-async function fetchOMDb(title) {
+
+/** TMDB API base request helper */
+async function tmdbGet(endpoint, params = {}) {
   try {
-    const r = await axios.get(OMDB_BASE, {
-      params: { apikey: OMDB_API_KEY, t: title, plot: 'short' },
-      timeout: 5000
+    const r = await axios.get(`${TMDB_BASE}${endpoint}`, {
+      params: { api_key: TMDB_API_KEY, ...params },
+      timeout: 8000
     });
-    return r.data?.Response === 'True' ? r.data : null;
-  } catch (e) { console.error('OMDb:', e.message); return null; }
+    return r.data;
+  } catch (e) {
+    console.error('[TMDB]', endpoint, e.response?.data?.status_message || e.message);
+    return null;
+  }
 }
 
-async function searchOMDb(query, year = '') {
-  try {
-    const r = await axios.get(OMDB_BASE, {
-      params: { apikey: OMDB_API_KEY, s: query, y: year, type: 'movie' },
-      timeout: 5000
-    });
-    return r.data?.Response === 'True' ? r.data.Search : [];
-  } catch (e) { console.error('OMDb search:', e.message); return []; }
+/** Title se TMDB movie search (first result) */
+async function fetchTMDBByTitle(title) {
+  const data = await tmdbGet('/search/movie', {
+    query: title,
+    language: 'en-US',
+    include_adult: false
+  });
+  if (!data?.results?.length) return null;
+  // Top result ka full detail lo
+  const top = data.results[0];
+  return fetchTMDBById(top.id);
 }
 
-// ═══════════════════════════════════════
-// 🇮🇳 INDIAN MOVIES FETCHERS
-// ═══════════════════════════════════════
-const INDIAN_KEYWORDS = [
-  'Bollywood', 'Hindi', 'Tamil', 'Telugu', 'Malayalam', 'Kannada',
-  'Shah Rukh Khan', 'Salman Khan', 'Aamir Khan', 'Akshay Kumar', 'Ajay Devgn',
-  'Rajinikanth', 'Vijay', 'Ajith', 'Allu Arjun', 'Prabhas', 'Yash'
-];
+/** TMDB movie ID se full detail */
+async function fetchTMDBById(tmdbId) {
+  return tmdbGet(`/movie/${tmdbId}`, {
+    language: 'en-US',
+    append_to_response: 'release_dates'
+  });
+}
 
+/**
+ * Now Playing Indian movies (IN region, sorted by date)
+ * TMDB /movie/now_playing — India region filter
+ */
 async function getIndianMoviesByType(type = 'new', count = 5) {
-  const year = type === 'new' ? new Date().getFullYear() : new Date().getFullYear() + 1;
-  const allMovies = [];
+  const today    = new Date().toISOString().slice(0, 10);
+  const future60 = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const past30   = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
-  for (const kw of INDIAN_KEYWORDS.slice(0, 8)) {
-    const res = await searchOMDb(kw, String(year));
-    allMovies.push(...res);
-    if (allMovies.length >= count * 3) break;
-    await new Promise(r => setTimeout(r, 200));
+  const langMap  = { hi:'Hindi', ta:'Tamil', te:'Telugu', ml:'Malayalam', kn:'Kannada', pa:'Punjabi', bn:'Bengali', mr:'Marathi' };
+  const langCodes = Object.keys(langMap); // hi, ta, te, ml, kn, pa, bn, mr
+
+  const dateFilter = type === 'new'
+    ? { 'primary_release_date.gte': past30, 'primary_release_date.lte': today }
+    : { 'primary_release_date.gte': today,  'primary_release_date.lte': future60 };
+
+  // TMDB discover: one call per language (pipe-separated does NOT work reliably)
+  const allResults = [];
+  for (const lang of langCodes) {
+    const data = await tmdbGet('/discover/movie', {
+      with_original_language: lang,
+      region:        'IN',
+      sort_by:       'release_date.desc',
+      include_adult: false,
+      language:      'en-US',
+      page:          1,
+      ...dateFilter
+    });
+    if (data?.results?.length) allResults.push(...data.results);
+    await new Promise(r => setTimeout(r, 150)); // rate limit
+    if (allResults.length >= count * 4) break;
   }
 
-  const unique = [...new Map(allMovies.map(m => [m.imdbID, m])).values()];
-  const indianMovies = [];
+  // Deduplicate by id
+  const seen = new Set();
+  const unique = allResults.filter(m => {
+    if (seen.has(m.id)) return false;
+    seen.add(m.id);
+    return true;
+  });
 
+  // Sort
+  unique.sort((a, b) => {
+    if (!a.release_date) return 1;
+    if (!b.release_date) return -1;
+    return type === 'new'
+      ? b.release_date.localeCompare(a.release_date)
+      : a.release_date.localeCompare(b.release_date);
+  });
+
+  const results = [];
   for (const m of unique) {
-    const details = await fetchOMDb(m.Title);
-    if (!details || !details.Poster || details.Poster === 'N/A') continue;
+    if (!m.poster_path) continue;
+    const poster      = `${TMDB_IMG}${m.poster_path}`;
+    const releaseDate = m.release_date || '';
+    const language    = langMap[m.original_language] || m.original_language?.toUpperCase() || 'N/A';
 
-    const lang    = (details.Language || '').toLowerCase();
-    const country = (details.Country  || '').toLowerCase();
-    const isIndian =
-      lang.includes('hindi') || lang.includes('tamil') || lang.includes('telugu') ||
-      lang.includes('malayalam') || lang.includes('kannada') ||
-      country.includes('india');
+    results.push({
+      Title:        m.title,
+      Year:         releaseDate ? releaseDate.slice(0, 4) : '?',
+      Poster:       poster,
+      Plot:         m.overview || 'N/A',
+      imdbRating:   m.vote_average ? m.vote_average.toFixed(1) : 'N/A',
+      Genre:        'N/A',
+      Language:     language,
+      _releaseDate: releaseDate,
+      _language:    language,
+      _tmdbId:      m.id,
+      _popularity:  m.popularity
+    });
 
-    if (isIndian) {
-      indianMovies.push(details);
-      if (indianMovies.length >= count) break;
-    }
-    await new Promise(r => setTimeout(r, 200));
+    if (results.length >= count) break;
   }
-  return indianMovies;
+
+  return results;
 }
+
+// ═══════════════════════════════════════
+// 📌 POSTED MOVIES TRACKER — Repeat na ho daily mein
+// postedMovies.json: { tmdbId: { title, postedOn: 'YYYY-MM-DD', type } }
+// ═══════════════════════════════════════
+let postedMovies = {};
+
+async function loadPostedMovies() {
+  postedMovies = await readJSON('postedMovies.json', {});
+}
+async function savePostedMovies() {
+  await writeJSON('postedMovies.json', postedMovies);
+}
+
+function wasPostedRecently(tmdbId, days = 7) {
+  const entry = postedMovies[String(tmdbId)];
+  if (!entry) return false;
+  const posted = new Date(entry.postedOn);
+  const diff   = (Date.now() - posted.getTime()) / (1000 * 60 * 60 * 24);
+  return diff < days;
+}
+
+function markAsPosted(tmdbId, title, type) {
+  postedMovies[String(tmdbId)] = {
+    title,
+    type,
+    postedOn: new Date().toISOString().slice(0, 10)
+  };
+  savePostedMovies(); // fire-and-forget
+}
+
+/**
+ * User search ke liye TMDB se movie details lao
+ */
+async function tmdbSearchByTitle(title) {
+  const data = await tmdbGet('/search/movie', {
+    query:          title,
+    language:       'en-US',
+    include_adult:  false
+  });
+  if (!data?.results?.length) return null;
+
+  const top    = data.results[0];
+  const detail = await tmdbGet(`/movie/${top.id}`, {
+    language:            'en-US',
+    append_to_response:  'credits'
+  });
+  if (!detail) return null;
+
+  const langMap  = { hi:'Hindi', ta:'Tamil', te:'Telugu', ml:'Malayalam', kn:'Kannada', pa:'Punjabi', bn:'Bengali', mr:'Marathi', en:'English' };
+  const language = langMap[detail.original_language] || detail.original_language?.toUpperCase() || 'N/A';
+  const genres   = detail.genres?.map(g => g.name).join(', ') || 'N/A';
+  const director = detail.credits?.crew?.find(c => c.job === 'Director')?.name || null;
+  const poster   = detail.poster_path ? `${TMDB_IMG}${detail.poster_path}` : null;
+
+  return {
+    Title:        detail.title,
+    Year:         detail.release_date?.slice(0, 4) || '?',
+    Poster:       poster,
+    Plot:         detail.overview || 'N/A',
+    imdbRating:   detail.vote_average ? detail.vote_average.toFixed(1) : 'N/A',
+    Genre:        genres,
+    Language:     language,
+    Director:     director,
+    _tmdbId:      detail.id,
+    _releaseDate: detail.release_date || null
+  };
+}
+
 
 // ═══════════════════════════════════════
 // 🔍 SEARCH HELPERS
@@ -762,28 +879,28 @@ bot.use(async (ctx, next) => {
   // ── Text message → Admin ko relay karo ──
   if (msg.text) {
     logMessage(userId, 'user', msg.text);
+    // Jo admin ne convo start kiya uske paas bhejo, fallback PRIMARY_ADMIN
+    const relayTo = adminConvoStartedBy || PRIMARY_ADMIN;
+    // ✅ Plain text — parse_mode: Markdown se special chars silently fail ho jaate hain
+    const relayText = `💬 [${name}] (${userId}):\n\n${msg.text}`;
     try {
-      const kb = new InlineKeyboard()
-        .text('🛑 Conversation Khatam Karo', 'endconvo_confirm');
-      await bot.api.sendMessage(PRIMARY_ADMIN,
-        `💬 *${escapeMarkdown(name)}* \\(${userId}\\):\n\n${escapeMarkdown(msg.text)}`,
-        { parse_mode: 'Markdown', reply_markup: kb }
-      );
+      const kb = new InlineKeyboard().text('🛑 End Conversation', 'endconvo_confirm');
+      await bot.api.sendMessage(relayTo, relayText, { reply_markup: kb });
     } catch (e) {
       console.error('[CONVO INTERCEPT] Relay failed:', e.message);
+      // Fallback — bina keyboard ke plain text
+      try { await bot.api.sendMessage(relayTo, relayText); } catch {}
     }
-    return; // next() call nahi — message handler nahi chalega
+    return;
   }
 
   // ── Sticker relay ──
   if (msg.sticker) {
     logMessage(userId, 'user', '[Sticker]');
+    const relayTo = adminConvoStartedBy || PRIMARY_ADMIN;
     try {
-      await bot.api.forwardMessage(PRIMARY_ADMIN, ctx.chat.id, msg.message_id);
-      await bot.api.sendMessage(PRIMARY_ADMIN,
-        `💬 *${escapeMarkdown(name)}* \\(${userId}\\) ne sticker bheja ↑`,
-        { parse_mode: 'Markdown' }
-      );
+      await bot.api.forwardMessage(relayTo, ctx.chat.id, msg.message_id);
+      await bot.api.sendMessage(relayTo, `💬 [${name}] (${userId}) ka sticker ↑`);
     } catch {}
     return;
   }
@@ -792,11 +909,11 @@ bot.use(async (ctx, next) => {
   if (msg.photo) {
     logMessage(userId, 'user', '[Photo]' + (msg.caption ? `: ${msg.caption}` : ''));
     try {
+      const relayTo = adminConvoStartedBy || PRIMARY_ADMIN;
       const bestPhoto = msg.photo[msg.photo.length - 1];
-      await bot.api.sendPhoto(PRIMARY_ADMIN, bestPhoto.file_id, {
-        caption: `💬 *${escapeMarkdown(name)}* \\(${userId}\\) ne photo bheja` +
-                 (msg.caption ? `:\n"${escapeMarkdown(msg.caption)}"` : ''),
-        parse_mode: 'Markdown'
+      const capText = msg.caption ? `\n"${msg.caption}"` : '';
+      await bot.api.sendPhoto(relayTo, bestPhoto.file_id, {
+        caption: `💬 [${name}] (${userId}) ne photo bheja${capText}`
       });
     } catch {}
     return;
@@ -805,10 +922,10 @@ bot.use(async (ctx, next) => {
   // ── Voice relay ──
   if (msg.voice) {
     logMessage(userId, 'user', '[Voice message]');
+    const relayTo = adminConvoStartedBy || PRIMARY_ADMIN;
     try {
-      await bot.api.sendVoice(PRIMARY_ADMIN, msg.voice.file_id, {
-        caption: `💬 *${escapeMarkdown(name)}* \\(${userId}\\) ka voice message ↑`,
-        parse_mode: 'Markdown'
+      await bot.api.sendVoice(relayTo, msg.voice.file_id, {
+        caption: `💬 [${name}] (${userId}) ka voice message`
       });
     } catch {}
     return;
@@ -817,12 +934,10 @@ bot.use(async (ctx, next) => {
   // ── Video relay ──
   if (msg.video) {
     logMessage(userId, 'user', '[Video]');
+    const relayTo = adminConvoStartedBy || PRIMARY_ADMIN;
     try {
-      await bot.api.forwardMessage(PRIMARY_ADMIN, ctx.chat.id, msg.message_id);
-      await bot.api.sendMessage(PRIMARY_ADMIN,
-        `💬 *${escapeMarkdown(name)}* \\(${userId}\\) ne video bheja ↑`,
-        { parse_mode: 'Markdown' }
-      );
+      await bot.api.forwardMessage(relayTo, ctx.chat.id, msg.message_id);
+      await bot.api.sendMessage(relayTo, `💬 [${name}] (${userId}) ne video bheja ↑`);
     } catch {}
     return;
   }
@@ -830,12 +945,10 @@ bot.use(async (ctx, next) => {
   // ── Document relay ──
   if (msg.document) {
     logMessage(userId, 'user', `[Document: ${msg.document.file_name || 'file'}]`);
+    const relayTo = adminConvoStartedBy || PRIMARY_ADMIN;
     try {
-      await bot.api.forwardMessage(PRIMARY_ADMIN, ctx.chat.id, msg.message_id);
-      await bot.api.sendMessage(PRIMARY_ADMIN,
-        `💬 *${escapeMarkdown(name)}* \\(${userId}\\) ne document bheja ↑`,
-        { parse_mode: 'Markdown' }
-      );
+      await bot.api.forwardMessage(relayTo, ctx.chat.id, msg.message_id);
+      await bot.api.sendMessage(relayTo, `💬 [${name}] (${userId}) ne document bheja ↑`);
     } catch {}
     return;
   }
@@ -936,52 +1049,68 @@ async function finishUpload(ctx, state) {
 // ═══════════════════════════════════════
 bot.command('start', async ctx => {
   const userId   = ctx.from.id;
-  const chatType = ctx.chat?.type; // 'private', 'group', 'supergroup', 'channel'
+  const chatType = ctx.chat?.type;
 
   trackUser(userId, ctx.from.first_name, ctx.from.username);
 
-  // ── Group mein /start → DM karne ko kaho ──
+  // ── Group mein /start → DM button ──
   if (chatType !== 'private') {
     const kb = new InlineKeyboard()
       .url('🤖 Bot DM Mein Start Karein', `https://t.me/${BOT_USERNAME}?start=from_group`);
     return ctx.reply(
-      `👋 *Namaste!*\n\nBot ko DM mein start karein taaki aap movies download kar sakein aur updates milti rahein!`,
-      { parse_mode: 'Markdown', reply_markup: kb }
+      `Bot ko DM mein start karein taaki movies download kar sakein aur updates milein.`,
+      { reply_markup: kb }
     ).catch(() => {});
   }
 
-  // ── Private DM start ──
-  const safeFirstName = escapeMarkdown(ctx.from.first_name);
+  // ── Mark bot_started in private ──
+  if (users[String(userId)] && !users[String(userId)].bot_started) {
+    users[String(userId)].bot_started = true;
+    saveUsers();
+  }
 
-  // Check if started from group referral
-  const startParam = ctx.match; // text after /start
+  const firstName  = ctx.from.first_name || 'User';
+  const startParam = ctx.match;
   const fromGroup  = startParam?.includes('from_group') || startParam?.includes('ref');
 
+  // ── From group referral ──
   if (fromGroup) {
-    await ctx.reply(
-      `✅ *Bot Successfully Start Ho Gaya!*\n\n` +
+    return ctx.reply(
+      `✅ *Bot Start Ho Gaya, ${escapeMarkdown(firstName)}!*\n\n` +
       `Ab aapko milega:\n` +
-      `• 📢 Daily movie updates\n` +
-      `• 🎬 Movie download notifications\n` +
-      `• 🗳️ Debate results\n` +
-      `• 📩 Request fulfillment DMs\n\n` +
-      `Ab movie ka naam type karo ya /help dekho 👇`,
+      `📢 Daily movie updates\n` +
+      `📩 Download notifications\n` +
+      `🗳️ Debate results\n` +
+      `🎬 Direct movie DMs\n\n` +
+      `👇 *Ab kya karo?*\n` +
+      `Movie ka naam type karo ya /help dekho.`,
       { parse_mode: 'Markdown' }
     ).catch(() => {});
   }
 
-  await tempAnim(ctx, WELCOME_GIF, {
-    caption:
-      `🎬 *Welcome to CineRadar AI, ${safeFirstName}\\!*\n\n` +
-      `🔍 Movie ka naam type karo \\(min 3 chars\\)\n` +
-      `🎭 Mood type karo: happy, sad, action\\.\\.\\.\n` +
-      `🎲 /random — Random movie\n` +
-      `🗳️ /debate — Live movie vote\n\n` +
-      `⏱️ Messages auto\\-delete in 3 min\\. Forward & save\\.\n` +
-      `⚡ *3x Fast Download ke liye website visit karein\\!*`,
-    parse_mode: 'MarkdownV2'
-  });
+  // ── Normal /start ──
+  return ctx.reply(
+    `🎬 *Welcome to CineRadar AI, ${escapeMarkdown(firstName)}!*\n\n` +
+    `━━━━━━━━━━━━━━━━━━━\n` +
+    `🔍 *Movie Dhundho*\n` +
+    `Movie ka naam type karo (min 3 letters)\n\n` +
+    `🎭 *Mood Se Dhundho*\n` +
+    `happy • sad • romantic • scary\n` +
+    `funny • action • chill • mystery\n` +
+    `Ya emoji bhejo: 😄 😢 ❤️ 😱 😂 💥\n\n` +
+    `🎲 /random — Random movie\n` +
+    `🗳️ /debate — Live movie vote\n` +
+    `🆕 /new — Nayi releases\n` +
+    `🔮 /upcoming — Aane wali movies\n` +
+    `📋 /myrequests — Apni requests\n` +
+    `❓ /help — Poori guide\n\n` +
+    `━━━━━━━━━━━━━━━━━━━\n` +
+    `⏱️ _Messages 3 min mein delete hote hain — forward karke save karo_\n` +
+    `⚡ _3x Fast Download ke liye website visit karein ek baar_`,
+    { parse_mode: 'Markdown' }
+  );
 });
+
 
 bot.command('help', async ctx => {
   const helpText =
@@ -1007,64 +1136,97 @@ bot.command('help', async ctx => {
 });
 
 bot.command('new', async ctx => {
-  const loading = await ctx.reply('🔄 Fetching new Indian releases...');
+  
+  const loading = await ctx.reply(`🔄 TMDB se nayi Indian releases dhundh raha hoon...`);
   try {
     const moviesList = await getIndianMoviesByType('new', 5);
     await bot.api.deleteMessage(ctx.chat.id, loading.message_id).catch(() => {});
     if (!moviesList.length) return tempReply(ctx, '❌ No new Indian movies found.');
+
     for (const m of moviesList) {
+      // Release date line — GPT data se accurate date
+      const relDate = m._releaseDate && m._releaseDate !== 'upcoming'
+        ? `📅 Release: ${m._releaseDate}\n`
+        : '';
+      const langLine = m._language && m._language !== 'N/A'
+        ? `🌐 ${escapeMarkdown(m._language)}\n`
+        : m.Language && m.Language !== 'N/A' ? `🌐 ${escapeMarkdown(m.Language)}\n` : '';
+
       const caption =
         `🆕 *${escapeMarkdown(m.Title)}* (${m.Year})\n` +
-        `⭐ IMDb: ${m.imdbRating || 'N/A'}\n` +
-        `🎭 ${escapeMarkdown(m.Genre || '')}\n` +
-        `📖 ${escapeMarkdown(m.Plot || '')}\n\n` +
-        `⚡ *3x Fast Download ke liye website par ek baar visit karein!*`;
+        relDate +
+        langLine +
+        (m.imdbRating && m.imdbRating !== 'N/A' ? `⭐ IMDb: ${m.imdbRating}/10\n` : '') +
+        (m.Genre && m.Genre !== 'N/A' ? `🎭 ${escapeMarkdown(m.Genre)}\n` : '') +
+        (m.Plot && m.Plot !== 'N/A' ? `\n📖 ${escapeMarkdown(m.Plot.slice(0,200))}\n` : '') +
+        `\n⚡ *3x Fast Download ke liye website par ek baar visit karein!*`;
+
       const isUploaded = searchMovies(m.Title).length > 0;
       const kb = new InlineKeyboard();
-      if (!isUploaded) {
-        kb.text('📩 Request', `request_${encodeURIComponent(m.Title)}`).row();
-      }
+      if (!isUploaded) kb.text('📩 Request', `request_${encodeURIComponent(m.Title)}`).row();
       kb.url('⚡ 3x Fast Download ke liye Website Visit Karein', WEBSITE_URL)
-        .row()
-        .url('📷 Instagram (Optional)', INSTAGRAM_URL);
-      await tempPhoto(ctx, m.Poster, { caption, parse_mode: 'Markdown', reply_markup: kb });
+        .row().url('📷 Instagram (Optional)', INSTAGRAM_URL);
+
+      if (m.Poster && m.Poster !== 'N/A') {
+        await tempPhoto(ctx, m.Poster, { caption, parse_mode: 'Markdown', reply_markup: kb });
+      } else {
+        await tempReply(ctx, caption, { parse_mode: 'Markdown', reply_markup: kb });
+      }
       await new Promise(r => setTimeout(r, 500));
     }
   } catch (e) {
+    console.error('[/new]', e.message);
     await bot.api.deleteMessage(ctx.chat.id, loading.message_id).catch(() => {});
-    await tempReply(ctx, '❌ Error fetching new movies.');
+    await tempReply(ctx, '❌ Error fetching new movies. Thodi der baad try karo.');
   }
 });
 
 bot.command('upcoming', async ctx => {
-  const loading = await ctx.reply('🔄 Fetching upcoming Indian movies...');
+  
+  const loading = await ctx.reply(`🔄 TMDB se upcoming Indian movies dhundh raha hoon...`);
   try {
     const moviesList = await getIndianMoviesByType('upcoming', 5);
     await bot.api.deleteMessage(ctx.chat.id, loading.message_id).catch(() => {});
     if (!moviesList.length) return tempReply(ctx, '❌ No upcoming Indian movies found.');
+
     for (const m of moviesList) {
+      const relDate = m._releaseDate && m._releaseDate !== 'upcoming'
+        ? `📅 Release Date: *${escapeMarkdown(m._releaseDate)}*\n`
+        : `📅 Coming Soon\n`;
+      const langLine = m._language && m._language !== 'N/A'
+        ? `🌐 ${escapeMarkdown(m._language)}\n`
+        : m.Language && m.Language !== 'N/A' ? `🌐 ${escapeMarkdown(m.Language)}\n` : '';
+
       const caption =
         `🔮 *${escapeMarkdown(m.Title)}* (${m.Year})\n` +
-        `⭐ IMDb: ${m.imdbRating || 'N/A'}\n` +
-        `🎭 ${escapeMarkdown(m.Genre || '')}\n` +
-        `📖 ${escapeMarkdown(m.Plot || '')}\n\n` +
-        `⚡ *3x Fast Download ke liye website par ek baar visit karein!*`;
-      const isUploaded2 = searchMovies(m.Title).length > 0;
+        relDate +
+        langLine +
+        (m.imdbRating && m.imdbRating !== 'N/A' ? `⭐ IMDb: ${m.imdbRating}/10\n` : '') +
+        (m.Genre && m.Genre !== 'N/A' ? `🎭 ${escapeMarkdown(m.Genre)}\n` : '') +
+        (m.Plot && m.Plot !== 'N/A' ? `\n📖 ${escapeMarkdown(m.Plot.slice(0,200))}\n` : '') +
+        `\n⚡ *3x Fast Download ke liye website par ek baar visit karein!*`;
+
+      const isUploaded = searchMovies(m.Title).length > 0;
       const kbUp = new InlineKeyboard();
-      if (!isUploaded2) {
-        kbUp.text('📩 Request', `request_${encodeURIComponent(m.Title)}`).row();
-      }
+      if (!isUploaded) kbUp.text('📩 Request', `request_${encodeURIComponent(m.Title)}`).row();
       kbUp.url('⚡ 3x Fast Download ke liye Website Visit Karein', WEBSITE_URL)
-        .row()
-        .url('📷 Instagram (Optional)', INSTAGRAM_URL);
-      await tempPhoto(ctx, m.Poster, { caption, parse_mode: 'Markdown', reply_markup: kbUp });
+        .row().url('📷 Instagram (Optional)', INSTAGRAM_URL);
+
+      if (m.Poster && m.Poster !== 'N/A') {
+        await tempPhoto(ctx, m.Poster, { caption, parse_mode: 'Markdown', reply_markup: kbUp });
+      } else {
+        await tempReply(ctx, caption, { parse_mode: 'Markdown', reply_markup: kbUp });
+      }
       await new Promise(r => setTimeout(r, 500));
     }
   } catch (e) {
+    console.error('[/upcoming]', e.message);
     await bot.api.deleteMessage(ctx.chat.id, loading.message_id).catch(() => {});
-    await tempReply(ctx, '❌ Error fetching upcoming movies.');
+    await tempReply(ctx, '❌ Error fetching upcoming movies. Thodi der baad try karo.');
   }
 });
+
+
 
 bot.command('myrequests', async ctx => {
   const uid  = ctx.from.id;
@@ -1504,7 +1666,8 @@ bot.command('convo', async ctx => {
   const info = users[String(targetId)];
   const name = info?.username ? `@${info.username}` : info?.first_name || `User ${targetId}`;
 
-  adminConvoTarget = String(targetId);
+  adminConvoTarget    = String(targetId);
+  adminConvoStartedBy = ctx.from.id; // ✅ Is admin ke paas user relay hoga
 
   const msgCount = chatLogs[String(targetId)]?.length || 0;
 
@@ -1540,7 +1703,8 @@ bot.command('endconvo', async ctx => {
   const prev = adminConvoTarget;
   const info = users[prev];
   const name = info?.username ? `@${info.username}` : info?.first_name || `User ${prev}`;
-  adminConvoTarget = null;
+  adminConvoTarget    = null;
+  adminConvoStartedBy = null;
 
   ctx.reply(
     `🛑 *Conversation Ended*\n\n` +
@@ -1712,10 +1876,23 @@ bot.command('queue_add', async ctx => {
   if (type !== 'new' && type !== 'upcoming') return ctx.reply('Type must be "new" or "upcoming".');
   const movieName = args.slice(1).join(' ');
 
-  const omdb = await fetchOMDb(movieName);
-  if (!omdb || !omdb.Poster || omdb.Poster === 'N/A') {
-    return ctx.reply('❌ Movie not found on OMDb.');
+  const tmdbData = await tmdbSearchByTitle(movieName);
+  if (!tmdbData || !tmdbData.Poster) {
+    return ctx.reply('❌ Movie not found on TMDB.');
   }
+
+  // Store in OMDB-compatible format for daily post reuse
+  const movieData = {
+    Title:        tmdbData.Title,
+    Year:         tmdbData.Year,
+    Poster:       tmdbData.Poster,
+    Plot:         tmdbData.Plot,
+    imdbRating:   tmdbData.imdbRating,
+    Language:     tmdbData.Language,
+    _releaseDate: tmdbData._releaseDate,
+    _language:    tmdbData.Language,
+    _tmdbId:      tmdbData._tmdbId
+  };
 
   const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
   let entry = dailyQueue.find(e => e.date === tomorrow);
@@ -1723,9 +1900,9 @@ bot.command('queue_add', async ctx => {
     entry = { date: tomorrow, items: [] };
     dailyQueue.push(entry);
   }
-  entry.items.push({ type, movieData: omdb });
+  entry.items.push({ type, movieData });
   await saveDailyQueue();
-  ctx.reply(`✅ "${omdb.Title}" added to ${type} queue for ${tomorrow}.`);
+  ctx.reply(`✅ "${tmdbData.Title}" added to ${type} queue for ${tomorrow}.`);
 });
 
 bot.command('queue_view', async ctx => {
@@ -1875,25 +2052,24 @@ bot.on('message', async (ctx, next) => {
   const chatType = ctx.chat?.type;
   if (!isAdmin && chatType && chatType !== 'private') {
     const userRecord = users[String(userId)];
-    const alreadyStarted = userRecord?.bot_started;
-    const lastPrompt     = userRecord?.bot_start_prompted;
-    // Sirf tab prompt karo: bot start nahi kiya AND (pehle prompt nahi diya ya 24 ghante se zyada ho gaye)
-    const needsPrompt = !alreadyStarted && (
-      !lastPrompt || (Date.now() - new Date(lastPrompt).getTime() > 24 * 60 * 60 * 1000)
-    );
+    // Sirf bilkul naye users jo pehli baar dikh rahe hain aur bot start nahi kiya
+    // Existing group members ko bilkul prompt mat karo — sirf genuinely new ones
+    const needsPrompt = !userRecord?.bot_started && !userRecord?.bot_start_prompted;
     if (needsPrompt) {
       const startKb = new InlineKeyboard()
-        .url('🤖 Bot DM Mein Start Karein (Zaroori!)', `https://t.me/${BOT_USERNAME}?start=from_group`);
+        .url('🤖 Bot Start Karein', `https://t.me/${BOT_USERNAME}?start=from_group`);
       ctx.reply(
-        `👋 *${escapeMarkdown(msg.from.first_name)}*, bot ko DM mein ek baar start karo!\n\n` +
-        `📩 Tabhi aapko movies, notifications aur downloads milenge.\n` +
-        `⬇️ Neeche button dabao:`,
+        `👋 *${escapeMarkdown(msg.from.first_name)}*, ek kaam karo!\n\n` +
+        `🤖 Bot ko apne DM mein start karo taaki:\n` +
+        `• 🎬 Movies seedha mile\n` +
+        `• 📩 Download notifications aayein\n\n` +
+        `_Sirf ek baar karna hai — button dabao:_`,
         { parse_mode: 'Markdown', reply_markup: startKb }
       ).catch(() => {});
-      if (users[String(userId)]) {
-        users[String(userId)].bot_start_prompted = new Date().toISOString();
-        saveUsers();
-      }
+      // Ek baar prompt ho gaya — dobara mat dikhao
+      trackUser(userId, msg.from.first_name, msg.from.username);
+      users[String(userId)].bot_start_prompted = new Date().toISOString();
+      saveUsers();
     }
   }
 
@@ -2042,14 +2218,15 @@ bot.on('message', async (ctx, next) => {
     saveUsers();
   }
 
-  const omdb = await fetchOMDb(parsedName);
+  const tmdb = await tmdbSearchByTitle(parsedName);
 
-  if (omdb && omdb.Poster && omdb.Poster !== 'N/A') {
-    let caption = `🎬 *${escapeMarkdown(omdb.Title)}* (${omdb.Year})\n`;
-    if (omdb.Genre      !== 'N/A') caption += `🎭 ${escapeMarkdown(omdb.Genre)}\n`;
-    if (omdb.imdbRating !== 'N/A') caption += `⭐ IMDb: ${omdb.imdbRating}/10\n`;
-    if (omdb.Director   !== 'N/A') caption += `🎥 ${escapeMarkdown(omdb.Director)}\n`;
-    if (omdb.Plot       !== 'N/A') caption += `\n📖 ${escapeMarkdown(omdb.Plot)}\n`;
+  if (tmdb && tmdb.Poster) {
+    let caption = `🎬 *${escapeMarkdown(tmdb.Title)}* (${tmdb.Year})\n`;
+    if (tmdb.Genre    !== 'N/A') caption += `🎭 ${escapeMarkdown(tmdb.Genre)}\n`;
+    if (tmdb.imdbRating !== 'N/A') caption += `⭐ TMDB: ${tmdb.imdbRating}/10\n`;
+    if (tmdb.Director) caption += `🎥 ${escapeMarkdown(tmdb.Director)}\n`;
+    if (tmdb.Language !== 'N/A') caption += `🌐 ${escapeMarkdown(tmdb.Language)}\n`;
+    if (tmdb.Plot !== 'N/A') caption += `\n📖 ${escapeMarkdown(tmdb.Plot.slice(0, 200))}\n`;
 
     let matches = searchMovies(parsedName);
     if (parsedYear) matches = matches.filter(m => String(m.year) === parsedYear);
@@ -2071,24 +2248,19 @@ bot.on('message', async (ctx, next) => {
 
       if (matches.length > 1) {
         const fkb = buildFilterKeyboard(parsedName, matches);
-        return tempPhoto(ctx, omdb.Poster, { caption, parse_mode: 'Markdown', reply_markup: mergeKeyboards(kb, fkb) });
+        return tempPhoto(ctx, tmdb.Poster, { caption, parse_mode: 'Markdown', reply_markup: mergeKeyboards(kb, fkb) });
       }
-      return tempPhoto(ctx, omdb.Poster, { caption, parse_mode: 'Markdown', reply_markup: kb });
+      return tempPhoto(ctx, tmdb.Poster, { caption, parse_mode: 'Markdown', reply_markup: kb });
     } else {
-      const alreadyUploaded = searchMovies(omdb.Title).length > 0;
-      if (alreadyUploaded) {
-        caption += `\n✅ *Available!* Search karo exact naam se.`;
-      } else {
-        caption += `\n❌ *Not available yet.*\n📩 Request below — admin will upload!`;
-      }
+      const alreadyUploaded = searchMovies(tmdb.Title).length > 0;
+      caption += alreadyUploaded
+        ? `\n✅ *Available!* Exact naam se search karo.`
+        : `\n❌ *Abhi available nahi.*\n📩 Request karo — admin upload karega!`;
       const kb = new InlineKeyboard();
-      if (!alreadyUploaded) {
-        kb.text('📩 Request', `request_${encodeURIComponent(omdb.Title)}`).row();
-      }
+      if (!alreadyUploaded) kb.text('📩 Request', `request_${encodeURIComponent(tmdb.Title)}`).row();
       kb.url('⚡ 3x Fast Download ke liye Website Visit Karein', WEBSITE_URL)
-        .row()
-        .url('📷 Instagram (Optional)', INSTAGRAM_URL);
-      return tempPhoto(ctx, omdb.Poster, { caption, parse_mode: 'Markdown', reply_markup: kb });
+        .row().url('📷 Instagram (Optional)', INSTAGRAM_URL);
+      return tempPhoto(ctx, tmdb.Poster, { caption, parse_mode: 'Markdown', reply_markup: kb });
     }
   }
 
@@ -2136,26 +2308,7 @@ bot.on('message', async (ctx, next) => {
     }
   }
 
-  const omdbFallback = await fetchOMDb(parsedName);
-  if (omdbFallback && omdbFallback.Poster && omdbFallback.Poster !== 'N/A') {
-    let caption = `🎬 *${escapeMarkdown(omdbFallback.Title)}* (${omdbFallback.Year})\n`;
-    if (omdbFallback.Plot !== 'N/A') caption += `\n📖 ${escapeMarkdown(omdbFallback.Plot)}\n`;
-    const alreadyUploaded2 = searchMovies(omdbFallback.Title).length > 0;
-    if (alreadyUploaded2) {
-      caption += `\n✅ *Available!* Search karo exact naam se.`;
-    } else {
-      caption += `\n❌ *Not in our database yet.*\n📩 Request below!`;
-    }
-    const kb = new InlineKeyboard();
-    if (!alreadyUploaded2) {
-      kb.text('📩 Request', `request_${encodeURIComponent(omdbFallback.Title)}`).row();
-    }
-    kb.url('⚡ 3x Fast Download ke liye Website Visit Karein', WEBSITE_URL)
-      .row()
-      .url('📷 Instagram (Optional)', INSTAGRAM_URL);
-    return tempPhoto(ctx, omdbFallback.Poster, { caption, parse_mode: 'Markdown', reply_markup: kb });
-  }
-
+  // TMDB se bhi kuch nahi mila — DB mein check karo
   const alreadyUploaded3 = searchMovies(parsedName).length > 0;
   const kb = new InlineKeyboard();
   if (!alreadyUploaded3) {
@@ -2318,7 +2471,8 @@ bot.on('callback_query:data', async ctx => {
     const prev = adminConvoTarget;
     const info = users[prev];
     const name = info?.username ? `@${info.username}` : info?.first_name || `User ${prev}`;
-    adminConvoTarget = null;
+    adminConvoTarget    = null;
+    adminConvoStartedBy = null;
     try { await ctx.editMessageReplyMarkup({ reply_markup: new InlineKeyboard() }); } catch {}
     await ctx.reply(`🛑 Conversation ended with ${escapeMarkdown(name)} (${prev})`, { parse_mode: 'Markdown' });
     return ctx.answerCallbackQuery({ text: '🛑 Conversation ended' });
@@ -2361,7 +2515,8 @@ bot.on('callback_query:data', async ctx => {
   if (data.startsWith('startconvo_')) {
     if (!isAdmin(userId)) return ctx.answerCallbackQuery({ text: '❌ Admin only' });
     const targetId = data.slice('startconvo_'.length);
-    adminConvoTarget = String(targetId);
+    adminConvoTarget    = String(targetId);
+    adminConvoStartedBy = userId; // ✅ Is admin ke paas relay jayega
     const info = users[String(targetId)];
     const name = info?.username ? `@${info.username}` : info?.first_name || `User ${targetId}`;
 
@@ -2774,40 +2929,70 @@ async function sendDailySuggestions() {
       newMoviesList      = todayQueue.items.filter(i => i.type === 'new').map(i => i.movieData);
       upcomingMoviesList = todayQueue.items.filter(i => i.type === 'upcoming').map(i => i.movieData);
     } else {
-      console.log('[DAILY] No queue found, fetching automatically...');
-      try { newMoviesList      = await getIndianMoviesByType('new', 3);      } catch (e) { console.error('[DAILY] New fetch error:', e); }
-      try { upcomingMoviesList = await getIndianMoviesByType('upcoming', 2); } catch (e) { console.error('[DAILY] Upcoming fetch error:', e); }
+      console.log('[DAILY] No queue found, fetching from TMDB...');
+      try {
+        const allNew = await getIndianMoviesByType('new', 10);
+        // Filter out already posted in last 7 days
+        newMoviesList = allNew
+          .filter(m => m._tmdbId && !wasPostedRecently(m._tmdbId, 7))
+          .slice(0, 3);
+        console.log(`[DAILY] New: ${newMoviesList.length} fresh movies (filtered repeats)`);
+      } catch (e) { console.error('[DAILY] New fetch error:', e); }
+
+      try {
+        const allUpcoming = await getIndianMoviesByType('upcoming', 10);
+        upcomingMoviesList = allUpcoming
+          .filter(m => m._tmdbId && !wasPostedRecently(m._tmdbId, 7))
+          .slice(0, 2);
+        console.log(`[DAILY] Upcoming: ${upcomingMoviesList.length} fresh movies (filtered repeats)`);
+      } catch (e) { console.error('[DAILY] Upcoming fetch error:', e); }
     }
 
     // ── 1. New releases ──
     for (const m of newMoviesList) {
-      if (!m.Poster || m.Poster === 'N/A') continue;
-      await bot.api.sendPhoto(CHANNEL, m.Poster, {
-        caption:
-          `🆕 *New Indian Release!*\n\n` +
-          `🎬 ${escapeMarkdown(m.Title)} (${m.Year})\n` +
-          `⭐ IMDb: ${m.imdbRating || 'N/A'}\n` +
-          `📖 ${escapeMarkdown(m.Plot || '')}\n\n` +
-          `📥 Bot mein search karo!\n` +
-          `⚡ *3x Fast Download ke liye website visit karein!*`,
-        parse_mode: 'Markdown'
-      }).catch(e => console.error('[DAILY] sendPhoto new error:', e.message));
+      const relLine = m._releaseDate ? `📅 Released: ${m._releaseDate}\n` : '';
+      const caption =
+        `🆕 *New Indian Release!*\n\n` +
+        `🎬 *${escapeMarkdown(m.Title)}* (${m.Year})\n` +
+        relLine +
+        `🌐 ${escapeMarkdown(m.Language || m._language || 'N/A')}\n` +
+        (m.imdbRating && m.imdbRating !== 'N/A' ? `⭐ TMDB: ${m.imdbRating}/10\n` : '') +
+        (m.Plot && m.Plot !== 'N/A' ? `\n📖 ${escapeMarkdown(m.Plot.slice(0, 180))}\n` : '') +
+        `\n📥 Bot mein search karo: @${BOT_USERNAME}\n` +
+        `⚡ *3x Fast Download ke liye website visit karein!*`;
+
+      try {
+        if (m.Poster) {
+          await bot.api.sendPhoto(CHANNEL, m.Poster, { caption, parse_mode: 'Markdown' });
+        } else {
+          await bot.api.sendMessage(CHANNEL, caption, { parse_mode: 'Markdown' });
+        }
+        if (m._tmdbId) markAsPosted(m._tmdbId, m.Title, 'new');
+      } catch (e) { console.error('[DAILY] sendPhoto new error:', e.message); }
       await new Promise(r => setTimeout(r, 1000));
     }
 
     // ── 2. Upcoming movies ──
     for (const m of upcomingMoviesList) {
-      if (!m.Poster || m.Poster === 'N/A') continue;
-      await bot.api.sendPhoto(CHANNEL, m.Poster, {
-        caption:
-          `🔮 *Upcoming Indian Movie!*\n\n` +
-          `🎬 ${escapeMarkdown(m.Title)} (${m.Year})\n` +
-          `⭐ IMDb: ${m.imdbRating || 'N/A'}\n` +
-          `📖 ${escapeMarkdown(m.Plot || '')}\n\n` +
-          `📥 Bot mein search karo!\n` +
-          `⚡ *3x Fast Download ke liye website visit karein!*`,
-        parse_mode: 'Markdown'
-      }).catch(e => console.error('[DAILY] sendPhoto upcoming error:', e.message));
+      const relLine = m._releaseDate ? `📅 Release Date: *${escapeMarkdown(m._releaseDate)}*\n` : `📅 Coming Soon\n`;
+      const caption =
+        `🔮 *Upcoming Indian Movie!*\n\n` +
+        `🎬 *${escapeMarkdown(m.Title)}* (${m.Year})\n` +
+        relLine +
+        `🌐 ${escapeMarkdown(m.Language || m._language || 'N/A')}\n` +
+        (m.imdbRating && m.imdbRating !== 'N/A' ? `⭐ TMDB: ${m.imdbRating}/10\n` : '') +
+        (m.Plot && m.Plot !== 'N/A' ? `\n📖 ${escapeMarkdown(m.Plot.slice(0, 180))}\n` : '') +
+        `\n📩 Request karo: @${BOT_USERNAME}\n` +
+        `⚡ *3x Fast Download ke liye website visit karein!*`;
+
+      try {
+        if (m.Poster) {
+          await bot.api.sendPhoto(CHANNEL, m.Poster, { caption, parse_mode: 'Markdown' });
+        } else {
+          await bot.api.sendMessage(CHANNEL, caption, { parse_mode: 'Markdown' });
+        }
+        if (m._tmdbId) markAsPosted(m._tmdbId, m.Title, 'upcoming');
+      } catch (e) { console.error('[DAILY] sendPhoto upcoming error:', e.message); }
       await new Promise(r => setTimeout(r, 1000));
     }
 

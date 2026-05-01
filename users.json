@@ -49,9 +49,11 @@
     "first_name": ".....",
     "username": "",
     "first_seen": "2026-04-20T13:51:23.465Z",
-    "last_seen": "2026-04-26T05:33:45.718Z",
-    "search_count": 27,
-    "downloads": 0
+    "last_seen": "2026-05-01T14:22:13.585Z",
+    "search_count": 30,
+    "downloads": 0,
+    "bot_start_prompted": "2026-05-01T08:22:02.774Z",
+    "bot_started": true
   },
   "620398936": {
     "id": 620398936,
@@ -62,6 +64,16 @@
     "search_count": 7,
     "downloads": 3,
     "lastWebsiteVisit": "2026-04-18T14:53:50.402Z"
+  },
+  "630255513": {
+    "id": 630255513,
+    "first_name": "Tushar",
+    "username": "Tush9545_sam",
+    "first_seen": "2026-04-30T20:09:02.669Z",
+    "last_seen": "2026-04-30T20:16:30.999Z",
+    "search_count": 1,
+    "downloads": 1,
+    "bot_started": true
   },
   "637869526": {
     "id": 637869526,
@@ -204,9 +216,9 @@
     "first_name": "Saqlain",
     "username": "",
     "first_seen": "2026-04-18T16:41:47.141Z",
-    "last_seen": "2026-04-29T10:58:37.649Z",
-    "search_count": 5,
-    "downloads": 1,
+    "last_seen": "2026-05-01T12:45:09.076Z",
+    "search_count": 11,
+    "downloads": 3,
     "bot_start_prompted": "2026-04-29T10:52:51.040Z",
     "bot_started": true
   },
@@ -431,9 +443,10 @@
     "first_name": "Omkar",
     "username": "",
     "first_seen": "2026-04-26T15:52:35.524Z",
-    "last_seen": "2026-04-26T15:52:50.975Z",
-    "search_count": 1,
-    "downloads": 1
+    "last_seen": "2026-05-01T08:14:52.964Z",
+    "search_count": 2,
+    "downloads": 5,
+    "bot_started": true
   },
   "1759176655": {
     "id": 1759176655,
@@ -490,6 +503,16 @@
     "downloads": 6,
     "bot_started": true
   },
+  "2047443453": {
+    "id": 2047443453,
+    "first_name": "rishav",
+    "username": "",
+    "first_seen": "2026-05-01T07:41:05.499Z",
+    "last_seen": "2026-05-01T07:41:47.778Z",
+    "search_count": 1,
+    "downloads": 0,
+    "bot_started": true
+  },
   "2052336404": {
     "id": 2052336404,
     "first_name": "Ashan",
@@ -505,9 +528,20 @@
     "first_name": "T",
     "username": "",
     "first_seen": "2026-04-13T04:04:55.033Z",
-    "last_seen": "2026-04-16T11:53:39.521Z",
-    "search_count": 3,
-    "downloads": 0
+    "last_seen": "2026-05-01T12:51:54.911Z",
+    "search_count": 5,
+    "downloads": 0,
+    "bot_started": true
+  },
+  "2138972360": {
+    "id": 2138972360,
+    "first_name": "Sahbaj",
+    "username": "JQ1dy7Ai976y",
+    "first_seen": "2026-05-01T06:12:15.441Z",
+    "last_seen": "2026-05-01T06:12:47.501Z",
+    "search_count": 1,
+    "downloads": 0,
+    "bot_started": true
   },
   "2145420481": {
     "id": 2145420481,
@@ -523,10 +557,10 @@
     "first_name": "Video",
     "username": "",
     "first_seen": "2026-04-11T09:02:39.602Z",
-    "last_seen": "2026-04-30T17:48:02.314Z",
-    "search_count": 214,
-    "downloads": 38,
-    "lastWebsiteVisit": "2026-04-28T20:47:22.922Z",
+    "last_seen": "2026-05-01T16:08:03.384Z",
+    "search_count": 281,
+    "downloads": 44,
+    "lastWebsiteVisit": "2026-05-01T07:34:26.349Z",
     "bot_started": true
   },
   "7891157539": {
@@ -677,12 +711,14 @@
   },
   "5144858962": {
     "id": 5144858962,
-    "first_name": "Twinkle",
-    "username": "twinkel_kashyap",
+    "first_name": "Shivani",
+    "username": "Spygirl_78",
     "first_seen": "2026-04-17T07:42:55.672Z",
-    "last_seen": "2026-04-18T04:34:51.913Z",
-    "search_count": 22,
-    "downloads": 0
+    "last_seen": "2026-05-01T14:38:59.584Z",
+    "search_count": 24,
+    "downloads": 0,
+    "bot_start_prompted": "2026-05-01T14:38:43.221Z",
+    "bot_started": true
   },
   "7575643102": {
     "id": 7575643102,
@@ -809,9 +845,11 @@
     "first_name": "Shahkhush",
     "username": "",
     "first_seen": "2026-04-17T17:38:48.064Z",
-    "last_seen": "2026-04-25T16:42:59.289Z",
-    "search_count": 3,
-    "downloads": 3
+    "last_seen": "2026-05-01T14:45:32.445Z",
+    "search_count": 9,
+    "downloads": 3,
+    "bot_start_prompted": "2026-05-01T09:17:28.162Z",
+    "bot_started": true
   },
   "5451975649": {
     "id": 5451975649,
@@ -1554,9 +1592,10 @@
     "first_name": "Jjj",
     "username": "",
     "first_seen": "2026-04-27T12:09:53.823Z",
-    "last_seen": "2026-04-28T19:45:01.105Z",
-    "search_count": 24,
-    "downloads": 12
+    "last_seen": "2026-05-01T09:14:47.516Z",
+    "search_count": 26,
+    "downloads": 12,
+    "bot_start_prompted": "2026-05-01T09:14:28.547Z"
   },
   "7350091949": {
     "id": 7350091949,
@@ -1684,7 +1723,7 @@
     "first_name": "Cineradar",
     "username": "Cinedbot",
     "first_seen": "2026-04-29T01:10:37.365Z",
-    "last_seen": "2026-04-30T00:27:49.088Z",
+    "last_seen": "2026-05-01T01:28:40.296Z",
     "search_count": 0,
     "downloads": 0,
     "bot_start_prompted": "2026-04-29T01:10:37.377Z"
@@ -1724,11 +1763,12 @@
     "first_name": "Trilochan",
     "username": "",
     "first_seen": "2026-04-29T12:02:29.888Z",
-    "last_seen": "2026-04-29T12:10:48.088Z",
-    "search_count": 2,
+    "last_seen": "2026-05-01T15:24:17.172Z",
+    "search_count": 8,
     "downloads": 3,
     "bot_start_prompted": "2026-04-29T12:02:29.897Z",
-    "lastWebsiteVisit": "2026-04-29T12:07:04.836Z"
+    "lastWebsiteVisit": "2026-04-29T12:07:04.836Z",
+    "bot_started": true
   },
   "8404561429": {
     "id": 8404561429,
@@ -1765,9 +1805,9 @@
     "first_name": "Hasnain",
     "username": "",
     "first_seen": "2026-04-30T07:13:32.580Z",
-    "last_seen": "2026-04-30T14:56:16.337Z",
-    "search_count": 6,
-    "downloads": 3,
+    "last_seen": "2026-04-30T18:24:01.922Z",
+    "search_count": 11,
+    "downloads": 8,
     "bot_started": true,
     "lastWebsiteVisit": "2026-04-30T07:15:04.641Z"
   },
@@ -1776,8 +1816,8 @@
     "first_name": "Shantanu",
     "username": "",
     "first_seen": "2026-04-30T07:59:26.217Z",
-    "last_seen": "2026-04-30T17:04:58.606Z",
-    "search_count": 4,
+    "last_seen": "2026-05-01T09:50:05.633Z",
+    "search_count": 5,
     "downloads": 0,
     "bot_started": true
   },
@@ -1796,9 +1836,73 @@
     "first_name": "ƝᏆᎢᏆN ⸙",
     "username": "OFF_LINE_xD",
     "first_seen": "2026-04-30T17:24:37.925Z",
-    "last_seen": "2026-04-30T17:26:08.500Z",
-    "search_count": 2,
+    "last_seen": "2026-05-01T10:53:40.963Z",
+    "search_count": 6,
+    "downloads": 3,
+    "bot_started": true
+  },
+  "7750709359": {
+    "id": 7750709359,
+    "first_name": "Mehan",
+    "username": "",
+    "first_seen": "2026-04-30T18:01:32.764Z",
+    "last_seen": "2026-04-30T18:18:02.111Z",
+    "search_count": 5,
     "downloads": 2,
+    "bot_start_prompted": "2026-04-30T18:01:32.790Z",
+    "bot_started": true,
+    "lastWebsiteVisit": "2026-04-30T18:19:35.470Z"
+  },
+  "7567719857": {
+    "id": 7567719857,
+    "first_name": "96k",
+    "username": "Nitrogen_88",
+    "first_seen": "2026-05-01T05:14:14.398Z",
+    "last_seen": "2026-05-01T05:14:17.531Z",
+    "search_count": 0,
+    "downloads": 0,
+    "bot_started": true
+  },
+  "5991594350": {
+    "id": 5991594350,
+    "first_name": "Tanmoy",
+    "username": "tanmoyroy1296",
+    "first_seen": "2026-05-01T09:19:34.196Z",
+    "last_seen": "2026-05-01T14:09:23.775Z",
+    "search_count": 4,
+    "downloads": 4,
+    "bot_start_prompted": "2026-05-01T09:19:34.207Z",
+    "bot_started": true,
+    "lastWebsiteVisit": "2026-05-01T10:47:31.554Z"
+  },
+  "8266816753": {
+    "id": 8266816753,
+    "first_name": "Vinay",
+    "username": "",
+    "first_seen": "2026-05-01T09:51:55.797Z",
+    "last_seen": "2026-05-01T09:51:55.797Z",
+    "search_count": 0,
+    "downloads": 0,
+    "bot_started": true
+  },
+  "6167508720": {
+    "id": 6167508720,
+    "first_name": "Jiya",
+    "username": "Jiyabhardwaj",
+    "first_seen": "2026-05-01T12:10:56.653Z",
+    "last_seen": "2026-05-01T12:11:08.338Z",
+    "search_count": 1,
+    "downloads": 0,
+    "bot_started": true
+  },
+  "8542672402": {
+    "id": 8542672402,
+    "first_name": "Aahil",
+    "username": "",
+    "first_seen": "2026-05-01T14:08:53.820Z",
+    "last_seen": "2026-05-01T14:09:05.200Z",
+    "search_count": 2,
+    "downloads": 0,
     "bot_started": true
   }
 }

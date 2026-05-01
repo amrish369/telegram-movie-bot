@@ -15,8 +15,6 @@ const CHANNEL_USERNAME = (process.env.CHANNEL || '@cineradarai').replace('@', ''
 const BOT_USERNAME   = process.env.BOT_USERNAME || 'cineradarai_bot';
 
 // ── MULTI-ADMIN SUPPORT ──────────────────────────────────────
-// .env mein: ADMIN_ID=111111,222222,333333  (comma separated)
-// Pehla ID = PRIMARY_ADMIN — notifications & convo relays yahan aate hain
 const ADMIN_IDS = new Set(
   (process.env.ADMIN_ID || '5951923988')
     .split(',')
@@ -214,12 +212,41 @@ async function saveDailyQueue() {
 // 🔍 FUSE.JS INDEX
 // ═══════════════════════════════════════
 let fuseIndex = null;
+
+// ── Helper: strip punctuation and lowercase for fuzzy matching ──
+function cleanName(str) {
+  return str.replace(/[^a-zA-Z0-9\s]/g, '').toLowerCase().trim();
+}
+
 function rebuildFuseIndex() {
   fuseIndex = new Fuse(Object.values(movies), {
-    keys: ['name'],
-    threshold: 0.4,
+    keys: [
+      { name: 'name',     weight: 0.5 },
+      { name: 'year',     weight: 0.2 },
+      { name: 'language', weight: 0.1 },
+      { name: 'clean',    weight: 0.2, get: (m) => cleanName(m.name) }
+    ],
+    threshold: 0.5,
+    minMatchCharLength: 3,
+    ignoreLocation: true,
     includeScore: true
   });
+}
+
+// ── New: return top N fuzzy results (score ≤ 0.6) ──
+function fuzzyMatchMultiple(query, limit = 5) {
+  if (!fuseIndex) return [];
+  const raw = fuseIndex.search(query);
+  return raw
+    .filter(r => r.score <= 0.6)
+    .slice(0, limit)
+    .map(r => r.item);
+}
+
+// ── Single best fuzzy match (score ≤ 0.6) ──
+function fuzzyMatch(query) {
+  const matches = fuzzyMatchMultiple(query, 1);
+  return matches.length ? matches[0] : null;
 }
 
 // ═══════════════════════════════════════
@@ -540,6 +567,34 @@ async function getIndianMoviesByType(type = 'new', count = 5) {
   return results;
 }
 
+/**
+ * TMDB se multiple search results lo — request movie selection ke liye
+ * Returns array of { title, year, language, tmdbId, poster }
+ */
+async function tmdbSearchMultiple(query, maxResults = 5) {
+  const data = await tmdbGet('/search/movie', {
+    query,
+    language:      'en-US',
+    include_adult: false,
+    page:          1
+  });
+  if (!data?.results?.length) return [];
+
+  const langMap = {
+    hi:'Hindi', ta:'Tamil', te:'Telugu', ml:'Malayalam',
+    kn:'Kannada', pa:'Punjabi', bn:'Bengali', mr:'Marathi', en:'English'
+  };
+
+  return data.results.slice(0, maxResults).map(m => ({
+    title:    m.title,
+    year:     m.release_date ? m.release_date.slice(0, 4) : '?',
+    language: langMap[m.original_language] || m.original_language?.toUpperCase() || 'N/A',
+    tmdbId:   m.id,
+    poster:   m.poster_path ? `${TMDB_IMG}${m.poster_path}` : null,
+    overview: m.overview || ''
+  }));
+}
+
 // ═══════════════════════════════════════
 // 📌 POSTED MOVIES TRACKER — Repeat na ho daily mein
 // postedMovies.json: { tmdbId: { title, postedOn: 'YYYY-MM-DD', type } }
@@ -621,12 +676,6 @@ function searchMovies(query, filters = {}) {
     if (filters.year     && String(m.year) !== String(filters.year))                             return false;
     return true;
   });
-}
-
-function fuzzyMatch(query) {
-  if (!fuseIndex) return null;
-  const r = fuseIndex.search(query);
-  return r.length && r[0].score <= 0.4 ? r[0].item.name : null;
 }
 
 function groupMovies(list) {
@@ -981,16 +1030,34 @@ async function finishUpload(ctx, state) {
   await saveDB();
   adminUploadState.delete(ctx.from.id);
 
-  // ── AUTO GENRE CACHE: Upload hote waqt hi genre fetch kar lo ──
-  fetchGenreForMovie(newMovie).catch(() => {}); // fire-and-forget, error ignored
+  // ── AUTO GENRE CACHE ──
+  fetchGenreForMovie(newMovie).catch(() => {});
 
-  const matchedRequesters = requests.filter(r =>
-    (!r.status || r.status === 'Pending') &&
-    (
-      r.movie.toLowerCase().includes(state.name.toLowerCase()) ||
-      state.name.toLowerCase().includes(r.movie.toLowerCase())
-    )
+  // ── FUZZY match pending requests — Fuse.js se naam match karo ──
+  // Simple includes() se "KGF 2" vs "KGF Chapter 2" miss hota tha
+  const pendingReqs = requests.filter(r => !r.status || r.status === 'Pending');
+  const reqFuse     = new Fuse(pendingReqs, {
+    keys:      ['movie'],
+    threshold: 0.5,   // 0 = exact, 1 = anything — 0.5 = reasonable fuzzy
+    includeScore: true
+  });
+
+  const fuseMatches  = reqFuse.search(state.name);
+  // Also include simple includes() matches to cover both sides
+  const includeMatch = pendingReqs.filter(r =>
+    r.movie.toLowerCase().includes(state.name.toLowerCase()) ||
+    state.name.toLowerCase().includes(r.movie.toLowerCase())
   );
+
+  // Merge, deduplicate by user+movie
+  const allMatched = [...fuseMatches.map(f => f.item), ...includeMatch];
+  const seen       = new Set();
+  const matchedRequesters = allMatched.filter(r => {
+    const k = `${r.user}_${r.movie}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
 
   let notifiedCount = 0;
   for (const req of matchedRequesters) {
@@ -1016,9 +1083,7 @@ async function finishUpload(ctx, state) {
         reply_markup: dmKb
       });
 
-      // Log bot message
       logMessage(req.user, 'bot', `[Auto-DM] Movie uploaded: ${state.name}`);
-
       req.status = 'Fulfilled';
       notifiedCount++;
     } catch (e) {
@@ -1163,7 +1228,11 @@ bot.command('new', async ctx => {
 
       const isUploaded = searchMovies(m.Title).length > 0;
       const kb = new InlineKeyboard();
-      if (!isUploaded) kb.text('📩 Request', `request_${encodeURIComponent(m.Title)}`).row();
+      if (!isUploaded) {
+        // Direct sequel buttons — req_pick_ intermediate step nah
+        const payload = encodeURIComponent(`${m.Title}|||${m.Year}|||${m._language || m.Language || 'N/A'}`);
+        kb.text(`📩 Request: ${m.Title} (${m.Year})`, `req_confirm_${payload}`).row();
+      }
       kb.url('⚡ 3x Fast Download ke liye Website Visit Karein', WEBSITE_URL)
         .row().url('📷 Instagram (Optional)', INSTAGRAM_URL);
 
@@ -1208,7 +1277,10 @@ bot.command('upcoming', async ctx => {
 
       const isUploaded = searchMovies(m.Title).length > 0;
       const kbUp = new InlineKeyboard();
-      if (!isUploaded) kbUp.text('📩 Request', `request_${encodeURIComponent(m.Title)}`).row();
+      if (!isUploaded) {
+        const payload = encodeURIComponent(`${m.Title}|||${m.Year}|||${m._language || m.Language || 'N/A'}`);
+        kbUp.text(`📩 Request: ${m.Title} (${m.Year})`, `req_confirm_${payload}`).row();
+      }
       kbUp.url('⚡ 3x Fast Download ke liye Website Visit Karein', WEBSITE_URL)
         .row().url('📷 Instagram (Optional)', INSTAGRAM_URL);
 
@@ -1231,10 +1303,14 @@ bot.command('upcoming', async ctx => {
 bot.command('myrequests', async ctx => {
   const uid  = ctx.from.id;
   const reqs = requests.filter(r => r.user === uid);
-  if (!reqs.length) return tempReply(ctx, "📭 You haven't requested any movies yet.");
-  let txt = `📩 *Your Requests (${reqs.length})*\n\n`;
-  reqs.slice(-10).forEach((r, i) => {
-    txt += `${i + 1}. 🎬 ${escapeMarkdown(r.movie)}\n   ${r.status || 'Pending'} — ${new Date(r.time).toLocaleDateString()}\n`;
+  if (!reqs.length) return tempReply(ctx, '📭 Abhi tak koi request nahi ki.\n\nMovie search karo aur Request button dabao.');
+  const statusEmoji = { Pending: '⏳', Fulfilled: '✅', Rejected: '❌' };
+  let txt = `📩 *Aapki Requests (${reqs.length})*\n\n`;
+  reqs.slice(-15).reverse().forEach(r => {
+    const emoji = statusEmoji[r.status] || '⏳';
+    const date  = new Date(r.time).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' });
+    txt += `${emoji} *${escapeMarkdown(r.movie)}*\n`;
+    txt += `   ${r.status || 'Pending'} — ${date}\n\n`;
   });
   await tempReply(ctx, txt, { parse_mode: 'Markdown' });
 });
@@ -1407,17 +1483,40 @@ bot.command('edit', async ctx => {
 
 bot.command('stats', async ctx => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('❌ Admin only.');
-  const totalDL = Object.values(movies).reduce((s, m) => s + (m.downloads || 0), 0);
-  const usersWithHistory = Object.keys(chatLogs).filter(uid => chatLogs[uid]?.length > 0).length;
-  ctx.reply(
-    `📊 *Bot Statistics*\n\n` +
-    `🎬 Movies: ${Object.keys(movies).length}\n` +
-    `👥 Users: ${Object.keys(users).length}\n` +
-    `⬇️ Total Downloads: ${totalDL}\n` +
-    `📩 Pending Requests: ${requests.filter(r => !r.status || r.status === 'Pending').length}\n` +
-    `🚫 Banned: ${Object.keys(banned).length}\n` +
-    `💬 Users with chat history: ${usersWithHistory}`,
-    { parse_mode: 'Markdown' });
+  const totalDL        = Object.values(movies).reduce((s, m) => s + (m.downloads || 0), 0);
+  const topMovies      = Object.values(movies).sort((a, b) => (b.downloads||0) - (a.downloads||0)).slice(0, 3);
+  const pendingCount   = requests.filter(r => !r.status || r.status === 'Pending').length;
+  const fulfilledCount = requests.filter(r => r.status === 'Fulfilled').length;
+  const startedUsers   = Object.values(users).filter(u => u.bot_started).length;
+  const withHistory    = Object.keys(chatLogs).filter(uid => chatLogs[uid]?.length > 0).length;
+  const cachedGenres   = Object.keys(genreCache).length;
+  const postedCount    = Object.keys(postedMovies).length;
+
+  let txt =
+    `📊 *CineRadar AI — Statistics*\n\n` +
+    `🎬 *Movies:* ${Object.keys(movies).length}\n` +
+    `⬇️ *Total Downloads:* ${totalDL}\n` +
+    `👥 *Total Users:* ${Object.keys(users).length}\n` +
+    `🤖 *Bot Started:* ${startedUsers}\n` +
+    `💬 *Users with History:* ${withHistory}\n` +
+    `📩 *Pending Requests:* ${pendingCount}\n` +
+    `✅ *Fulfilled Requests:* ${fulfilledCount}\n` +
+    `🎭 *Genre Cached:* ${cachedGenres}/${Object.keys(movies).length}\n` +
+    `📢 *Posted to Channel:* ${postedCount}\n` +
+    `🚫 *Banned:* ${Object.keys(banned).length}\n`;
+
+  if (topMovies.length) {
+    txt += `\n🏆 *Top Downloads:*\n`;
+    topMovies.forEach((m, i) => {
+      txt += `${i + 1}\\. ${escapeMarkdown(m.name)} — ${m.downloads || 0} downloads\n`;
+    });
+  }
+
+  const activeConvo = adminConvoTarget
+    ? `\n💬 *Active Convo:* User ${adminConvoTarget}` : '';
+  txt += activeConvo;
+
+  ctx.reply(txt, { parse_mode: 'Markdown' });
 });
 
 bot.command('broadcast', async ctx => {
@@ -2220,70 +2319,59 @@ bot.on('message', async (ctx, next) => {
 
   const tmdb = await tmdbSearchByTitle(parsedName);
 
-  if (tmdb && tmdb.Poster) {
+  if (tmdb) {
+    // ── TMDB result mila (poster ho ya na ho) ──
     let caption = `🎬 *${escapeMarkdown(tmdb.Title)}* (${tmdb.Year})\n`;
-    if (tmdb.Genre    !== 'N/A') caption += `🎭 ${escapeMarkdown(tmdb.Genre)}\n`;
-    if (tmdb.imdbRating !== 'N/A') caption += `⭐ TMDB: ${tmdb.imdbRating}/10\n`;
-    if (tmdb.Director) caption += `🎥 ${escapeMarkdown(tmdb.Director)}\n`;
-    if (tmdb.Language !== 'N/A') caption += `🌐 ${escapeMarkdown(tmdb.Language)}\n`;
-    if (tmdb.Plot !== 'N/A') caption += `\n📖 ${escapeMarkdown(tmdb.Plot.slice(0, 200))}\n`;
+    if (tmdb.Genre      && tmdb.Genre      !== 'N/A') caption += `🎭 ${escapeMarkdown(tmdb.Genre)}\n`;
+    if (tmdb.imdbRating && tmdb.imdbRating !== 'N/A') caption += `⭐ TMDB: ${tmdb.imdbRating}/10\n`;
+    if (tmdb.Director)                                 caption += `🎥 ${escapeMarkdown(tmdb.Director)}\n`;
+    if (tmdb.Language   && tmdb.Language   !== 'N/A') caption += `🌐 ${escapeMarkdown(tmdb.Language)}\n`;
+    if (tmdb.Plot       && tmdb.Plot       !== 'N/A') caption += `\n📖 ${escapeMarkdown(tmdb.Plot.slice(0, 200))}\n`;
 
     let matches = searchMovies(parsedName);
     if (parsedYear) matches = matches.filter(m => String(m.year) === parsedYear);
     if (parsedLang) matches = matches.filter(m => (m.language || '').toLowerCase() === parsedLang.toLowerCase());
 
     if (matches.length > 0) {
-      caption += `\n✅ *Available — ${matches.length} version(s)*`;
-      caption += `\n\n⚡ *3x Fast Download chahiye? Neeche button dabao!*`;
-
+      caption += `\n✅ *Available — ${matches.length} version(s)*\n⚡ *Neeche se download karo!*`;
       const kb = new InlineKeyboard();
       matches.forEach(m => {
         kb.text(movieBtnLabel(m), `send_${m.id}`).row();
-        if (isAdmin && adminEditMode[userId]) {
-          kb.text(`✏️ Edit "${m.name.slice(0, 20)}"`, `edit_${m.id}`).row();
-        }
+        if (isAdmin && adminEditMode[userId]) kb.text(`✏️ Edit "${m.name.slice(0, 20)}"`, `edit_${m.id}`).row();
       });
       kb.url('⚡ 3x Fast Download ke liye Website Visit Karein', WEBSITE_URL).row();
       kb.url('📷 Instagram Follow Karein (Optional)', INSTAGRAM_URL);
-
       if (matches.length > 1) {
         const fkb = buildFilterKeyboard(parsedName, matches);
-        return tempPhoto(ctx, tmdb.Poster, { caption, parse_mode: 'Markdown', reply_markup: mergeKeyboards(kb, fkb) });
+        if (tmdb.Poster) return tempPhoto(ctx, tmdb.Poster, { caption, parse_mode: 'Markdown', reply_markup: mergeKeyboards(kb, fkb) });
+        return tempReply(ctx, caption, { parse_mode: 'Markdown', reply_markup: mergeKeyboards(kb, fkb) });
       }
-      return tempPhoto(ctx, tmdb.Poster, { caption, parse_mode: 'Markdown', reply_markup: kb });
+      if (tmdb.Poster) return tempPhoto(ctx, tmdb.Poster, { caption, parse_mode: 'Markdown', reply_markup: kb });
+      return tempReply(ctx, caption, { parse_mode: 'Markdown', reply_markup: kb });
+
     } else {
-      const alreadyUploaded = searchMovies(tmdb.Title).length > 0;
-      caption += alreadyUploaded
-        ? `\n✅ *Available!* Exact naam se search karo.`
-        : `\n❌ *Abhi available nahi.*\n📩 Request karo — admin upload karega!`;
-      const kb = new InlineKeyboard();
-      if (!alreadyUploaded) kb.text('📩 Request', `request_${encodeURIComponent(tmdb.Title)}`).row();
-      kb.url('⚡ 3x Fast Download ke liye Website Visit Karein', WEBSITE_URL)
-        .row().url('📷 Instagram (Optional)', INSTAGRAM_URL);
-      return tempPhoto(ctx, tmdb.Poster, { caption, parse_mode: 'Markdown', reply_markup: kb });
+      // Not in DB — show TMDB multi-results as request options
+      return showTMDBRequestButtons(ctx, parsedName, tmdb.Poster || null, caption);
     }
   }
 
+  // ── DB search (no TMDB result) ──
   let results = searchMovies(parsedName);
   if (parsedYear) results = results.filter(m => String(m.year) === parsedYear);
   if (parsedLang) results = results.filter(m => (m.language || '').toLowerCase() === parsedLang.toLowerCase());
 
   if (results.length > 0) {
-    let txt = `🎬 *Found ${results.length} result(s) for "${escapeMarkdown(sanitize(msg.text))}"*\n\n`;
+    let txt = `🎬 *${results.length} movie(s) mili "${escapeMarkdown(sanitize(msg.text))}" ke liye:*\n\n`;
     const grouped = groupMovies(results);
     grouped.forEach(g => { txt += `• *${escapeMarkdown(g.displayName)}* ${g.year || ''}\n`; });
-    txt += `\n🔽 *Tap to download:*\n\n⚡ *3x Fast Download ke liye neeche website visit karein!*`;
-
+    txt += `\n🔽 *Tap to download:*\n⚡ *3x Fast Download ke liye website visit karein!*`;
     const kb = new InlineKeyboard();
     results.forEach(m => {
       kb.text(movieBtnLabel(m), `send_${m.id}`).row();
-      if (isAdmin && adminEditMode[userId]) {
-        kb.text(`✏️ Edit`, `edit_${m.id}`).row();
-      }
+      if (isAdmin && adminEditMode[userId]) kb.text(`✏️ Edit`, `edit_${m.id}`).row();
     });
     kb.url('⚡ 3x Fast Download ke liye Website Visit Karein', WEBSITE_URL).row();
     kb.url('📷 Instagram Follow Karein (Optional)', INSTAGRAM_URL);
-
     if (results.length > 1) {
       const fkb = buildFilterKeyboard(parsedName, results);
       return tempReply(ctx, txt, { parse_mode: 'Markdown', reply_markup: mergeKeyboards(kb, fkb) });
@@ -2291,38 +2379,98 @@ bot.on('message', async (ctx, next) => {
     return tempReply(ctx, txt, { parse_mode: 'Markdown', reply_markup: kb });
   }
 
-  const suggestion = fuzzyMatch(parsedName);
-  if (suggestion) {
-    let sugResults = searchMovies(suggestion);
-    if (parsedYear) sugResults = sugResults.filter(m => String(m.year) === parsedYear);
-    if (parsedLang) sugResults = sugResults.filter(m => (m.language || '').toLowerCase() === parsedLang.toLowerCase());
+  // ═══════════════════════════════════════
+  // 🧠 FUZZY FALLBACK — Database fuzzy search before TMDB
+  // ═══════════════════════════════════════
+  const fuzzyResults = fuzzyMatchMultiple(query, 5);
+  if (fuzzyResults.length) {
+    const fuzzyTxt =
+      `🔍 *Database mein similar mila:*\n\n` +
+      fuzzyResults.map(m => `• *${escapeMarkdown(m.name)}* (${m.year || '?'})`).join('\n') +
+      `\n\n__Direct search nahi mila, shayad aap yahi dhundh rahe the?__`;
 
-    if (sugResults.length) {
-      const kb = new InlineKeyboard();
-      sugResults.forEach(m => kb.text(movieBtnLabel(m), `send_${m.id}`).row());
-      kb.url('⚡ 3x Fast Download ke liye Website Visit Karein', WEBSITE_URL).row();
-      kb.url('📷 Instagram (Optional)', INSTAGRAM_URL);
-      return tempReply(ctx,
-        `❓ *"${escapeMarkdown(sanitize(msg.text))}"* not found.\n\nDid you mean *${escapeMarkdown(suggestion)}*?`,
-        { parse_mode: 'Markdown', reply_markup: kb });
+    const fuzzyKb = new InlineKeyboard();
+    fuzzyResults.forEach(m => {
+      fuzzyKb.text(movieBtnLabel(m), `send_${m.id}`).row();
+      if (isAdmin && adminEditMode[userId]) fuzzyKb.text(`✏️ Edit "${m.name.slice(0, 20)}"`, `edit_${m.id}`).row();
+    });
+    fuzzyKb.url('⚡ 3x Fast Download', WEBSITE_URL).row();
+    fuzzyKb.url('📷 Instagram (Optional)', INSTAGRAM_URL);
+    return tempReply(ctx, fuzzyTxt, { parse_mode: 'Markdown', reply_markup: fuzzyKb });
+  }
+
+  // ── Nothing found anywhere — TMDB multi-search with fuzzy as fallback ──
+  return showTMDBRequestButtons(ctx, parsedName, null, null);
+});
+
+// ═══════════════════════════════════════
+// 🔍 TMDB MULTI-BUTTON REQUEST — Direct sequel/version buttons
+// "spiderman" → 5 buttons | "baaghi" → 4 buttons | typo → fuzzy 5 buttons
+// ═══════════════════════════════════════
+async function showTMDBRequestButtons(ctx, query, fallbackPoster, existingCaption) {
+  // Fetch up to 8 results from TMDB
+  let tmdbResults = await tmdbSearchMultiple(query, 8);
+
+  // Fuzzy fallback — remove last word for typo recovery
+  if (tmdbResults.length < 3) {
+    const words = query.trim().split(' ');
+    if (words.length > 1) {
+      const shortQuery = words.slice(0, -1).join(' ');
+      const extra      = await tmdbSearchMultiple(shortQuery, 8);
+      const seen       = new Set(tmdbResults.map(r => r.tmdbId));
+      for (const r of extra) {
+        if (!seen.has(r.tmdbId)) { tmdbResults.push(r); seen.add(r.tmdbId); }
+      }
     }
   }
 
-  // TMDB se bhi kuch nahi mila — DB mein check karo
-  const alreadyUploaded3 = searchMovies(parsedName).length > 0;
+  const displayResults = tmdbResults.slice(0, 8);
+  const safeQuery      = escapeMarkdown(query);
+
+  // Build keyboard
   const kb = new InlineKeyboard();
-  if (!alreadyUploaded3) {
-    kb.text('📩 Request Movie', `request_${encodeURIComponent(parsedName)}`).row();
+  for (const r of displayResults) {
+    const label   = `🎬 ${r.title} (${r.year}) — ${r.language}`.slice(0, 64);
+    const payload = encodeURIComponent(`${r.title}|||${r.year}|||${r.language}`);
+    kb.text(label, `req_confirm_${payload}`).row();
   }
-  kb.url('⚡ 3x Fast Download ke liye Website Visit Karein', WEBSITE_URL)
-    .row()
-    .url('📷 Instagram (Optional)', INSTAGRAM_URL);
+
+  // ✅ HAMESHA request button dikhao — chahe TMDB mein mile ya na mile
+  kb.text(`📩 "${query.slice(0, 30)}" Request Karein`, `req_pick_${encodeURIComponent(query)}`).row();
+  kb.url('⚡ Website Visit Karein', WEBSITE_URL);
+
+  if (displayResults.length > 0) {
+    // TMDB results mile — poster ke saath ya bina poster ke
+    if (fallbackPoster) {
+      // existingCaption mein already details hain — sirf availability line add karo
+      const addLine = `\n❌ Abhi hamare paas nahi hai.\n\nKaunsi movie chahiye? Select karo:`;
+      return tempPhoto(ctx, fallbackPoster, {
+        caption:      (existingCaption || '') + addLine,
+        parse_mode:   'Markdown',
+        reply_markup: kb
+      });
+    }
+
+    // No poster — plain text
+    return tempReply(ctx,
+      `❌ *"${safeQuery}"* abhi hamare paas nahi hai.\n\n` +
+      `TMDB pe yeh movies mili hain — sahi wali select karo:\n` +
+      `_Ek click mein request admin ke paas jayegi_`,
+      { parse_mode: 'Markdown', reply_markup: kb }
+    );
+  }
+
+  // ✅ Truly nothing on TMDB — phir bhi request button dikhao
   return tempReply(ctx,
-    alreadyUploaded3
-      ? `✅ *"${escapeMarkdown(sanitize(msg.text))}"* available hai! Thoda alag naam se search karo.`
-      : `❌ *"${escapeMarkdown(sanitize(msg.text))}"* not found.\n\nRequest it below!`,
-    { parse_mode: 'Markdown', reply_markup: kb });
-});
+    `❌ *"${safeQuery}"* TMDB pe bhi nahi mili.\n\n` +
+    `Naam thoda alag ho sakta hai — check karo:\n` +
+    `• Spelling sahi hai?\n` +
+    `• Hindi film ka English naam try karo\n\n` +
+    `Phir bhi request karna chahte ho?`,
+    { parse_mode: 'Markdown', reply_markup: kb }
+  );
+}
+
 
 // ═══════════════════════════════════════
 // 🔘 CALLBACK HANDLER
@@ -2661,7 +2809,111 @@ bot.on('callback_query:data', async ctx => {
     return ctx.answerCallbackQuery({ text: `${results.length} result(s)` });
   }
 
-  // ── Movie request ──
+
+
+  // ══════════════════════════════════════════════════════
+  // 📩 req_pick_ — TMDB se options dikhao user ko select karne ke liye
+  // ══════════════════════════════════════════════════════
+  if (data.startsWith('req_pick_')) {
+    const rawQuery = decodeURIComponent(data.slice('req_pick_'.length));
+    await ctx.answerCallbackQuery({ text: '🔍 TMDB pe dhundh raha hoon...' });
+
+    const tmdbResults = await tmdbSearchMultiple(rawQuery, 6);
+
+    if (!tmdbResults.length) {
+      // TMDB pe kuch nahi mila — direct request save karo
+      const already = requests.find(r =>
+        r.user === userId &&
+        r.movie.toLowerCase() === rawQuery.toLowerCase() &&
+        (!r.status || r.status === 'Pending')
+      );
+      if (already) {
+        return ctx.reply('⚠️ Yeh movie already request ki hui hai!');
+      }
+      requests.push({ user: userId, movie: rawQuery, time: new Date().toISOString(), status: 'Pending' });
+      await saveRequests();
+      logMessage(userId, 'user', `[Request] ${rawQuery}`);
+      await tempReply(ctx, `✅ Request bhej di: ${rawQuery}\n\n/myrequests se track karo.`);
+      const userInfo  = users[String(userId)];
+      const userLabel = userInfo?.username ? `@${userInfo.username}` : userInfo?.first_name || String(userId);
+      for (const adminId of ADMIN_IDS) {
+        try { await bot.api.sendMessage(adminId, `📩 New Request\n\n🎬 ${rawQuery}\n👤 ${userLabel} (${userId})`); } catch {}
+      }
+      return;
+    }
+
+    // TMDB results mile — buttons banao
+    const kb = new InlineKeyboard();
+    for (const r of tmdbResults) {
+      const label   = `🎬 ${r.title} (${r.year}) — ${r.language}`.slice(0, 64);
+      const payload = encodeURIComponent(`${r.title}|||${r.year}|||${r.language}`);
+      kb.text(label, `req_confirm_${payload}`).row();
+    }
+    kb.text('❌ Cancel', 'noop');
+
+    await tempReply(ctx,
+      `🔍 "${rawQuery}" ke liye TMDB pe yeh movies mili hain:\n\nSahi movie select karo — wahi request mein jayegi:`,
+      { reply_markup: kb }
+    );
+    return;
+  }
+
+  // ══════════════════════════════════════════════════════
+  // ✅ req_confirm_ — User ne exact movie button dabaya — save karo
+  // ══════════════════════════════════════════════════════
+  if (data.startsWith('req_confirm_')) {
+    const payload = decodeURIComponent(data.slice('req_confirm_'.length));
+    const parts   = payload.split('|||');
+    const title   = parts[0] || payload;
+    const year    = parts[1] || '';
+    const lang    = parts[2] || '';
+
+    // Request ke liye full naam: "Movie Name (Year) - Language"
+    const requestName = year ? `${title} (${year})` : title;
+
+    const already = requests.find(r =>
+      r.user === userId &&
+      r.movie.toLowerCase() === requestName.toLowerCase() &&
+      (!r.status || r.status === 'Pending')
+    );
+    if (already) {
+      return ctx.answerCallbackQuery({ text: `⚠️ "${requestName}" already requested hai!`, show_alert: true });
+    }
+
+    requests.push({
+      user:     userId,
+      movie:    requestName,
+      language: lang || undefined,
+      time:     new Date().toISOString(),
+      status:   'Pending'
+    });
+    await saveRequests();
+    logMessage(userId, 'user', `[Request Confirmed] ${requestName}`);
+
+    await ctx.answerCallbackQuery({ text: `✅ Request sent: ${requestName.slice(0, 40)}` });
+    await tempReply(ctx,
+      `✅ *Request Bhej Di!*\n\n` +
+      `🎬 *${escapeMarkdown(requestName)}*\n` +
+      (lang ? `🌐 ${escapeMarkdown(lang)}\n` : '') +
+      `\n📋 /myrequests se track karo.`,
+      { parse_mode: 'Markdown' }
+    );
+
+    // Saare admins ko notify karo
+    const userInfo  = users[String(userId)];
+    const userLabel = userInfo?.username ? `@${userInfo.username}` : userInfo?.first_name || String(userId);
+    const notifText =
+      `📩 *New Movie Request*\n\n` +
+      `🎬 *${escapeMarkdown(requestName)}*\n` +
+      (lang ? `🌐 ${escapeMarkdown(lang)}\n` : '') +
+      `👤 ${escapeMarkdown(String(userLabel))} (${userId})`;
+    for (const adminId of ADMIN_IDS) {
+      try { await bot.api.sendMessage(adminId, notifText, { parse_mode: 'Markdown' }); } catch {}
+    }
+    return;
+  }
+
+  // ── Movie request (legacy — direct naam se, bina TMDB options) ──
   if (data.startsWith('request_')) {
     const movieName = decodeURIComponent(data.slice('request_'.length));
     const already = requests.find(r =>
@@ -2675,11 +2927,13 @@ bot.on('callback_query:data', async ctx => {
     await saveRequests();
     logMessage(userId, 'user', `[Request] ${movieName}`);
     await tempReply(ctx, `✅ *Request sent for "${escapeMarkdown(movieName)}"!*\n\nUse /myrequests to track.`, { parse_mode: 'Markdown' });
-    try {
-      await bot.api.sendMessage(PRIMARY_ADMIN,
-        `📩 *New Request*\n\n🎬 ${escapeMarkdown(movieName)}\n👤 User: ${userId}`,
-        { parse_mode: 'Markdown' });
-    } catch {}
+
+    const userInfo  = users[String(userId)];
+    const userLabel = userInfo?.username ? `@${userInfo.username}` : userInfo?.first_name || String(userId);
+    const notifText = `📩 *New Movie Request*\n\n🎬 ${escapeMarkdown(movieName)}\n👤 ${escapeMarkdown(String(userLabel))} (${userId})`;
+    for (const adminId of ADMIN_IDS) {
+      try { await bot.api.sendMessage(adminId, notifText, { parse_mode: 'Markdown' }); } catch {}
+    }
     return ctx.answerCallbackQuery({ text: '✅ Request sent!' });
   }
 
@@ -2740,7 +2994,15 @@ bot.on('callback_query:data', async ctx => {
     req.status = 'Fulfilled';
     await saveRequests();
 
-    const matchedMovies = searchMovies(movieName);
+    // ✅ Fuzzy search — improved threshold
+    let matchedMovies = searchMovies(movieName);
+    if (matchedMovies.length === 0 && fuseIndex) {
+      const fuzzyRes = fuseIndex.search(movieName);
+      if (fuzzyRes.length > 0 && fuzzyRes[0].score <= 0.6) {  // was 0.5, now 0.6
+        matchedMovies = [fuzzyRes[0].item];
+        console.log(`[rdi] Fuzzy matched "${movieName}" → "${fuzzyRes[0].item.name}" (score: ${fuzzyRes[0].score.toFixed(2)})`);
+      }
+    }
 
     if (matchedMovies.length === 0) {
       try {
@@ -2788,7 +3050,8 @@ bot.on('callback_query:data', async ctx => {
       await ctx.reply(
         `✅ *Request Fulfilled!*\n\n` +
         `🎬 ${escapeMarkdown(m.name)}\n` +
-        `👤 User: ${reqUser}\n` +
+        `📩 "${escapeMarkdown(movieName)}" request thi\n` +
+        `👤 User: \`${reqUser}\`\n` +
         `📨 Video DM bhej di gayi!`,
         { parse_mode: 'Markdown' }
       ).catch(() => {});
@@ -3154,4 +3417,3 @@ bot.start({
   drop_pending_updates: true,
   onStart: info => console.log(`🚀 @${info.username} running — grammY`)
 });
-

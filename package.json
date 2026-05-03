@@ -11,6 +11,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "adm-zip": "^0.5.17",
     "axios": "^1.15.0",
     "dotenv": "^17.4.1",
     "fuse.js": "^7.3.0",

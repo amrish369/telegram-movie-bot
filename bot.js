@@ -32,6 +32,24 @@ const INSTAGRAM_URL  = 'https://www.instagram.com/_www.compressdocument.in?igsh=
 
 if (!BOT_TOKEN)    throw new Error('❌ BOT_TOKEN missing in .env');
 if (!TMDB_API_KEY) throw new Error('❌ TMDB_API_KEY missing in .env');
+
+// ========== FIX: Short‑key store for long callback payloads ==========
+const requestPayloadStore = new Map();
+let storeCounter = 0;
+
+function storePayload(data) {
+  const key = String(storeCounter++);
+  requestPayloadStore.set(key, data);
+  // auto‑clean after 24 hours
+  setTimeout(() => requestPayloadStore.delete(key), 24 * 60 * 60 * 1000);
+  return key;
+}
+
+function getPayloadData(key) {
+  return requestPayloadStore.get(key) || null;
+}
+// ====================================================================
+
 // ═══════════════════════════════════════
 // 🎭 MOOD MAP — keywords + emojis → genre tags
 // ═══════════════════════════════════════
@@ -172,8 +190,6 @@ async function filterMoviesByMood(movieList, mood) {
 
   return matched.map(x => x.movie);
 }
-
-
 
 /**
  * Log a message in chatLogs
@@ -839,7 +855,7 @@ bot.use(banCheck);
 // 🔔 FORCE JOIN MIDDLEWARE
 // Admin aur already-joined users ko pass karo.
 // Baaki sabko channel join karne ke liye kaho.
-// Isse "bot blocked" wale users bhi channel se wapas active hote hain.
+// AB /start bhi force-join ke under aata hai (DM mein bhi).
 // ═══════════════════════════════════════
 bot.use(async (ctx, next) => {
   const userId = ctx.from?.id;
@@ -875,10 +891,8 @@ bot.use(async (ctx, next) => {
     return next();
   }
 
-  // Message updates — /start allow karo bina check ke
-  if (ctx.message?.text?.startsWith('/start')) return next();
-
-  // Membership check
+  // ❌ AB /start ko bhi membership check ke bina nahi choda jayega
+  // Membership check for ALL messages
   const joined = await isChannelMember(userId);
   if (!joined) {
     return sendForceJoinMsg(ctx);
@@ -1230,8 +1244,12 @@ bot.command('new', async ctx => {
       const kb = new InlineKeyboard();
       if (!isUploaded) {
         // Direct sequel buttons — req_pick_ intermediate step nah
-        const payload = encodeURIComponent(`${m.Title}|||${m.Year}|||${m._language || m.Language || 'N/A'}`);
-        kb.text(`📩 Request: ${m.Title} (${m.Year})`, `req_confirm_${payload}`).row();
+        const payloadKey = storePayload({
+          title: m.Title,
+          year: m.Year,
+          language: m._language || m.Language || 'N/A'
+        });
+        kb.text(`📩 Request: ${m.Title} (${m.Year})`, `req_confirm_${payloadKey}`).row();
       }
       kb.url('⚡ 3x Fast Download ke liye Website Visit Karein', WEBSITE_URL)
         .row().url('📷 Instagram (Optional)', INSTAGRAM_URL);
@@ -1278,8 +1296,12 @@ bot.command('upcoming', async ctx => {
       const isUploaded = searchMovies(m.Title).length > 0;
       const kbUp = new InlineKeyboard();
       if (!isUploaded) {
-        const payload = encodeURIComponent(`${m.Title}|||${m.Year}|||${m._language || m.Language || 'N/A'}`);
-        kbUp.text(`📩 Request: ${m.Title} (${m.Year})`, `req_confirm_${payload}`).row();
+        const payloadKey = storePayload({
+          title: m.Title,
+          year: m.Year,
+          language: m._language || m.Language || 'N/A'
+        });
+        kbUp.text(`📩 Request: ${m.Title} (${m.Year})`, `req_confirm_${payloadKey}`).row();
       }
       kbUp.url('⚡ 3x Fast Download ke liye Website Visit Karein', WEBSITE_URL)
         .row().url('📷 Instagram (Optional)', INSTAGRAM_URL);
@@ -2138,7 +2160,7 @@ bot.on('my_chat_member', async ctx => {
 bot.on('message', async (ctx, next) => {
   const msg     = ctx.message;
   const userId  = msg.from.id;
-  const isAdmin = ADMIN_IDS.has(userId);
+  const isAdminUser = ADMIN_IDS.has(userId);
 
   trackUser(userId, msg.from.first_name, msg.from.username);
 
@@ -2149,7 +2171,7 @@ bot.on('message', async (ctx, next) => {
   // register ho jayein aur DMs milne lagein.
   // ══════════════════════════════════════════════════════
   const chatType = ctx.chat?.type;
-  if (!isAdmin && chatType && chatType !== 'private') {
+  if (!isAdminUser && chatType && chatType !== 'private') {
     const userRecord = users[String(userId)];
     // Sirf bilkul naye users jo pehli baar dikh rahe hain aur bot start nahi kiya
     // Existing group members ko bilkul prompt mat karo — sirf genuinely new ones
@@ -2173,7 +2195,7 @@ bot.on('message', async (ctx, next) => {
   }
 
   // Mark user as bot_started when they message in private
-  if (!isAdmin && chatType === 'private' && users[String(userId)] && !users[String(userId)].bot_started) {
+  if (!isAdminUser && chatType === 'private' && users[String(userId)] && !users[String(userId)].bot_started) {
     users[String(userId)].bot_started = true;
     saveUsers();
   }
@@ -2182,7 +2204,7 @@ bot.on('message', async (ctx, next) => {
   // If admin is in convo mode and sends a plain text message
   // (not a command), relay it to the target user
   // ══════════════════════════════════════════════════════
-  if (isAdmin && adminConvoTarget && msg.text && !msg.text.startsWith('/')) {
+  if (isAdminUser && adminConvoTarget && msg.text && !msg.text.startsWith('/')) {
     const targetUserId = adminConvoTarget;
     const info = users[targetUserId];
     const name = info?.username ? `@${info.username}` : info?.first_name || `User ${targetUserId}`;
@@ -2211,14 +2233,14 @@ bot.on('message', async (ctx, next) => {
   }
 
   // ─── Normal upload flow ───────────────────────────────────
-  if (isAdmin && (msg.video || msg.document)) {
+  if (isAdminUser && (msg.video || msg.document)) {
     const fileId   = msg.video?.file_id   || msg.document?.file_id;
     const fileSize = msg.video?.file_size  || msg.document?.file_size || null;
     adminUploadState.set(userId, { step: 'name', file_id: fileId, size: fileSize });
     return ctx.reply('✅ File received!\n\n📝 *Step 1/4:* Enter movie name:', { parse_mode: 'Markdown' });
   }
 
-  const uploadState = isAdmin ? adminUploadState.get(userId) : null;
+  const uploadState = isAdminUser ? adminUploadState.get(userId) : null;
   if (uploadState && msg.text) {
     const text = sanitize(msg.text);
     if (!text) return;
@@ -2276,7 +2298,7 @@ bot.on('message', async (ctx, next) => {
   const rawQuery = sanitize(msg.text);
 
   // ── Log user search message ──
-  if (!isAdmin) {
+  if (!isAdminUser) {
     logMessage(userId, 'user', rawQuery);
   }
 
@@ -2337,7 +2359,7 @@ bot.on('message', async (ctx, next) => {
       const kb = new InlineKeyboard();
       matches.forEach(m => {
         kb.text(movieBtnLabel(m), `send_${m.id}`).row();
-        if (isAdmin && adminEditMode[userId]) kb.text(`✏️ Edit "${m.name.slice(0, 20)}"`, `edit_${m.id}`).row();
+        if (isAdminUser && adminEditMode[userId]) kb.text(`✏️ Edit "${m.name.slice(0, 20)}"`, `edit_${m.id}`).row();
       });
       kb.url('⚡ 3x Fast Download ke liye Website Visit Karein', WEBSITE_URL).row();
       kb.url('📷 Instagram Follow Karein (Optional)', INSTAGRAM_URL);
@@ -2368,7 +2390,7 @@ bot.on('message', async (ctx, next) => {
     const kb = new InlineKeyboard();
     results.forEach(m => {
       kb.text(movieBtnLabel(m), `send_${m.id}`).row();
-      if (isAdmin && adminEditMode[userId]) kb.text(`✏️ Edit`, `edit_${m.id}`).row();
+      if (isAdminUser && adminEditMode[userId]) kb.text(`✏️ Edit`, `edit_${m.id}`).row();
     });
     kb.url('⚡ 3x Fast Download ke liye Website Visit Karein', WEBSITE_URL).row();
     kb.url('📷 Instagram Follow Karein (Optional)', INSTAGRAM_URL);
@@ -2392,7 +2414,7 @@ bot.on('message', async (ctx, next) => {
     const fuzzyKb = new InlineKeyboard();
     fuzzyResults.forEach(m => {
       fuzzyKb.text(movieBtnLabel(m), `send_${m.id}`).row();
-      if (isAdmin && adminEditMode[userId]) fuzzyKb.text(`✏️ Edit "${m.name.slice(0, 20)}"`, `edit_${m.id}`).row();
+      if (isAdminUser && adminEditMode[userId]) fuzzyKb.text(`✏️ Edit "${m.name.slice(0, 20)}"`, `edit_${m.id}`).row();
     });
     fuzzyKb.url('⚡ 3x Fast Download', WEBSITE_URL).row();
     fuzzyKb.url('📷 Instagram (Optional)', INSTAGRAM_URL);
@@ -2431,8 +2453,8 @@ async function showTMDBRequestButtons(ctx, query, fallbackPoster, existingCaptio
   const kb = new InlineKeyboard();
   for (const r of displayResults) {
     const label   = `🎬 ${r.title} (${r.year}) — ${r.language}`.slice(0, 64);
-    const payload = encodeURIComponent(`${r.title}|||${r.year}|||${r.language}`);
-    kb.text(label, `req_confirm_${payload}`).row();
+    const payloadKey = storePayload({ title: r.title, year: r.year, language: r.language });
+    kb.text(label, `req_confirm_${payloadKey}`).row();
   }
 
   // ✅ HAMESHA request button dikhao — chahe TMDB mein mile ya na mile
@@ -2809,8 +2831,6 @@ bot.on('callback_query:data', async ctx => {
     return ctx.answerCallbackQuery({ text: `${results.length} result(s)` });
   }
 
-
-
   // ══════════════════════════════════════════════════════
   // 📩 req_pick_ — TMDB se options dikhao user ko select karne ke liye
   // ══════════════════════════════════════════════════════
@@ -2846,8 +2866,8 @@ bot.on('callback_query:data', async ctx => {
     const kb = new InlineKeyboard();
     for (const r of tmdbResults) {
       const label   = `🎬 ${r.title} (${r.year}) — ${r.language}`.slice(0, 64);
-      const payload = encodeURIComponent(`${r.title}|||${r.year}|||${r.language}`);
-      kb.text(label, `req_confirm_${payload}`).row();
+      const payloadKey = storePayload({ title: r.title, year: r.year, language: r.language });
+      kb.text(label, `req_confirm_${payloadKey}`).row();
     }
     kb.text('❌ Cancel', 'noop');
 
@@ -2862,13 +2882,27 @@ bot.on('callback_query:data', async ctx => {
   // ✅ req_confirm_ — User ne exact movie button dabaya — save karo
   // ══════════════════════════════════════════════════════
   if (data.startsWith('req_confirm_')) {
-    const payload = decodeURIComponent(data.slice('req_confirm_'.length));
-    const parts   = payload.split('|||');
-    const title   = parts[0] || payload;
-    const year    = parts[1] || '';
-    const lang    = parts[2] || '';
+    let title, year, lang;
 
-    // Request ke liye full naam: "Movie Name (Year) - Language"
+    const payloadPart = data.slice('req_confirm_'.length);
+    const stored = getPayloadData(payloadPart);
+    if (stored) {
+      title = stored.title;
+      year = stored.year || '';
+      lang = stored.language || '';
+    } else {
+      // Legacy fallback: URL‑encoded string (backward compatibility)
+      try {
+        const decoded = decodeURIComponent(payloadPart);
+        const parts = decoded.split('|||');
+        title = parts[0] || '';
+        year  = parts[1] || '';
+        lang  = parts[2] || '';
+      } catch {
+        return ctx.answerCallbackQuery({ text: '❌ Invalid request data', show_alert: true });
+      }
+    }
+
     const requestName = year ? `${title} (${year})` : title;
 
     const already = requests.find(r =>
@@ -2998,7 +3032,7 @@ bot.on('callback_query:data', async ctx => {
     let matchedMovies = searchMovies(movieName);
     if (matchedMovies.length === 0 && fuseIndex) {
       const fuzzyRes = fuseIndex.search(movieName);
-      if (fuzzyRes.length > 0 && fuzzyRes[0].score <= 0.6) {  // was 0.5, now 0.6
+      if (fuzzyRes.length > 0 && fuzzyRes[0].score <= 0.6) {
         matchedMovies = [fuzzyRes[0].item];
         console.log(`[rdi] Fuzzy matched "${movieName}" → "${fuzzyRes[0].item.name}" (score: ${fuzzyRes[0].score.toFixed(2)})`);
       }

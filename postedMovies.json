@@ -1,4 +1,9 @@
 {
+  "896453": {
+    "title": "Flashback",
+    "type": "new",
+    "postedOn": "2026-05-02"
+  },
   "1171094": {
     "title": "Ek Din",
     "type": "upcoming",
@@ -9,19 +14,64 @@
     "type": "new",
     "postedOn": "2026-05-01"
   },
+  "1433117": {
+    "title": "Kara",
+    "type": "new",
+    "postedOn": "2026-05-02"
+  },
   "1576377": {
     "title": "Jetlee",
     "type": "new",
     "postedOn": "2026-05-01"
+  },
+  "1606210": {
+    "title": "Bromance Kadhal",
+    "type": "new",
+    "postedOn": "2026-05-02"
   },
   "1630661": {
     "title": "Gaayapadda Simham",
     "type": "new",
     "postedOn": "2026-05-01"
   },
+  "1640189": {
+    "title": "Itlu Kanmani",
+    "type": "upcoming",
+    "postedOn": "2026-05-02"
+  },
   "1649576": {
     "title": "Kashmir 1947",
     "type": "upcoming",
     "postedOn": "2026-05-01"
+  },
+  "1673393": {
+    "title": "Krishnavataram Part 1 : The Heart",
+    "type": "upcoming",
+    "postedOn": "2026-05-03"
+  },
+  "1673962": {
+    "title": "Isolation : The Call.",
+    "type": "upcoming",
+    "postedOn": "2026-05-02"
+  },
+  "1679742": {
+    "title": "Mast Mahila Mandali",
+    "type": "new",
+    "postedOn": "2026-05-03"
+  },
+  "1679791": {
+    "title": "Motive For Murder(M4M)",
+    "type": "upcoming",
+    "postedOn": "2026-05-03"
+  },
+  "1680844": {
+    "title": "The Curious Case Of Robert Ledru",
+    "type": "new",
+    "postedOn": "2026-05-03"
+  },
+  "1685629": {
+    "title": "Sodhara",
+    "type": "new",
+    "postedOn": "2026-05-03"
   }
 }
